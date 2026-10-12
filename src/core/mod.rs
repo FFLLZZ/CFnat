@@ -15,7 +15,7 @@ pub mod types;
 pub use backend::Backend;
 pub use cancel::CancellationToken;
 pub use config::Config;
-pub use forward::run_forward;
+pub use forward::{run_forward, ConnectionRegistry};
 pub(crate) use httping::{run_continuous_httping, HttpingConfig};
 pub(crate) use hyper::build_hyper_client;
 pub use ip::IpPool;
