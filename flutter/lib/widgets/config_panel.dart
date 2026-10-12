@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:provider/provider.dart';
@@ -399,7 +400,7 @@ class _ConfigPanelState extends State<ConfigPanel> {
           controller.text = path;
         } else {
           final bytes = await file.readAsBytes();
-          final content = String.fromCharCodes(bytes);
+          final content = utf8.decode(bytes, allowMalformed: true);
           setState(() {
             _ipContent = content.split('\n')
                 .map((line) => line.trim())

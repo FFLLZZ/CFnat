@@ -49,6 +49,14 @@ class ApiService extends AppService {
         client.close();
         return;
       }
+      // 非 200 时不进入解析循环，直接按断开处理走重连
+      if (response.statusCode != 200) {
+        client.close();
+        if (generation != _streamGeneration) return;
+        _handleDisconnect();
+        _scheduleReconnect();
+        return;
+      }
       
       _streamSubscription = response.stream
           .transform(utf8.decoder)

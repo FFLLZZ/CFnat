@@ -218,10 +218,11 @@ impl IpPool {
                     let range_size = (end - start).saturating_add(1);
                     let is_ipv6 = matches!(cidr, IpCidr::V6(_, _));
 
+                    // 采样数不得大于段长，否则等分区间跨出段边界（如 /31、/127）
                     let sample_count = if let Some(count) = custom_count {
                         count.min(range_size)
                     } else {
-                        calculate_sample_count(cidr.prefix_len(), !is_ipv6)
+                        calculate_sample_count(cidr.prefix_len(), !is_ipv6).min(range_size)
                     };
 
                     let interval_size = if sample_count > 0 {
@@ -316,6 +317,94 @@ impl IpPool {
             }
             self.cursor.store(0, Ordering::Relaxed);
             self.active_count.store(self.segments.len(), Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn in_range(cidr: &IpCidr, ip: IpAddr) -> bool {
+        let (start, end) = cidr.range_u128();
+        let val = match ip {
+            IpAddr::V4(v4) => u32::from(v4) as u128,
+            IpAddr::V6(v6) => u128::from(v6),
+        };
+        val >= start && val <= end
+    }
+
+    /// 采样数可能超过段长（如 /31 只有 2 个地址），所有产出必须仍在段内
+    #[test]
+    fn cidr_sampling_stays_in_range() {
+        for source in ["10.0.0.0/31", "10.0.0.0/30", "2001:db8::/127", "2001:db8::/126", "10.0.0.0/24"] {
+            let cidr = IpCidr::parse(source).unwrap();
+            let pool = IpPool::new(&[source.to_string()]);
+            let mut seen = 0u64;
+            for _ in 0..pool.total_count() {
+                let ip = pool.pop().expect("段未耗尽时应产出 IP");
+                assert!(in_range(&cidr, ip), "{source} 采样越界: {ip}");
+                seen += 1;
+            }
+            assert_eq!(seen, pool.total_count());
+        }
+    }
+
+    #[test]
+    fn single_host_yields_exactly_one() {
+        let pool = IpPool::new(&["10.0.0.1/32".to_string(), "10.0.0.2".to_string()]);
+        assert_eq!(pool.total_count(), 2);
+        let mut got = Vec::new();
+        for _ in 0..pool.total_count() {
+            got.push(pool.pop().unwrap());
+        }
+        got.sort();
+        assert_eq!(got, vec![
+            IpAddr::from_str("10.0.0.1").unwrap(),
+            IpAddr::from_str("10.0.0.2").unwrap()
+        ]);
+    }
+
+    #[test]
+    fn custom_count_is_respected_and_capped() {
+        // 请求 100 个但段只有 4 个地址
+        let pool = IpPool::new(&["10.0.0.0/30=100".to_string()]);
+        let cidr = IpCidr::parse("10.0.0.0/30").unwrap();
+        let mut count = 0u64;
+        for _ in 0..pool.total_count() {
+            let ip = pool.pop().unwrap();
+            assert!(in_range(&cidr, ip));
+            count += 1;
+        }
+        assert!(count <= 4);
+    }
+
+    #[test]
+    fn pop_wraps_after_exhaustion() {
+        let pool = IpPool::new(&["10.0.0.0/31".to_string()]);
+        let cidr = IpCidr::parse("10.0.0.0/31").unwrap();
+        // 耗尽后池会重置继续产出，产出仍必须落在段内
+        for _ in 0..3 * pool.total_count() {
+            let ip = pool.pop().expect("重置后应继续产出");
+            assert!(in_range(&cidr, ip), "重置后采样越界: {ip}");
+        }
+    }
+
+    #[test]
+    fn multiple_segments_are_all_drained() {
+        let pool = IpPool::new(&[
+            "10.0.0.0/31".to_string(),
+            "192.168.1.0/31".to_string(),
+            "10.0.1.5".to_string(),
+        ]);
+        assert_eq!(pool.total_count(), 5);
+        for _ in 0..5 {
+            let ip = pool.pop().unwrap();
+            let ok = in_range(&IpCidr::parse("10.0.0.0/31").unwrap(), ip)
+                || in_range(&IpCidr::parse("192.168.1.0/31").unwrap(), ip)
+                || ip == IpAddr::from_str("10.0.1.5").unwrap();
+            assert!(ok, "越界采样: {ip}");
         }
     }
 }
