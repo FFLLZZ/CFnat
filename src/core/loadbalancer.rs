@@ -1,10 +1,12 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
+use tokio::task::JoinHandle;
 
 use crate::core::backend::Backend;
 use crate::core::cancel::CancellationToken;
@@ -30,6 +32,7 @@ const DEFAULT_MAX_STICKY_SLOTS: usize = 5;
 /// 健康检查 JoinSet 中单个任务的产出
 type CheckTaskOutput = Result<(Arc<Backend>, Option<PingResultDetail>), tokio::task::JoinError>;
 
+/// 墙上时钟毫秒：只用于给用户展示的时刻，不参与任何时长判定
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -37,10 +40,27 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// 单调毫秒的零点，进程内首次取用时固定
+static MONO_BASE: OnceLock<Instant> = OnceLock::new();
+
+/// 单调毫秒：TTL 等"持续时长"判定用它，语义是有效运行时长；
+/// 墙上时钟会被系统挂起与校时推动，用它算时长会让恢复后的判断失真
+fn mono_ms() -> u64 {
+    MONO_BASE.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// TTL 到期判定。要求两个时刻同源（都用 mono_ms）：混用挂钟值时
+/// 差值会被 saturating_sub 饱和成 0，槽会被误判为永不过期
+#[inline]
+fn slot_expired(current_ms: u64, last_access_ms: u64, ttl_ms: u64) -> bool {
+    current_ms.saturating_sub(last_access_ms) >= ttl_ms
+}
+
 #[derive(Debug)]
 struct StickySlot {
     backend: Arc<Backend>,
     last_switch: Instant,
+    /// 单调毫秒（mono_ms），与展示用的墙上时钟是两个时钟
     last_access_ms: AtomicU64,
     interval: Duration,
 }
@@ -122,8 +142,10 @@ impl LoadBalancer {
             client: RwLock::new(None),
             colo_filter: None,
             sticky_slots: RwLock::new(Vec::new()),
-            last_expand_ms: AtomicU64::new(now_ms()),
+            // 与 maintain_sticky_slots 里的比较同源，必须用单调毫秒
+            last_expand_ms: AtomicU64::new(mono_ms()),
             cancel_token: CancellationToken::new(),
+            // 仅用于界面倒计时，走墙上时钟
             next_health_check_ms: AtomicU64::new(now_ms()),
             max_sticky_slots: DEFAULT_MAX_STICKY_SLOTS,
         }
@@ -264,7 +286,7 @@ impl LoadBalancer {
     }
 
     fn select_from_slots(&self, slots: &[&StickySlot], len: usize) -> Option<Arc<Backend>> {
-        let current_ms = now_ms();
+        let current_ms = mono_ms();
         let on_select = |slot: &StickySlot| {
             slot.last_access_ms.store(current_ms, Ordering::Release);
         };
@@ -333,7 +355,7 @@ impl LoadBalancer {
 
     fn maintain_sticky_slots(&self, pool: &[Arc<Backend>]) {
         let now = Instant::now();
-        let current_ms = now_ms();
+        let current_ms = mono_ms();
         let ttl_ms = get_global_config().sticky_slot_ttl.as_millis() as u64;
         let expand_interval_ms = get_global_config().sticky_slot_expand_interval.as_millis() as u64;
         
@@ -343,8 +365,7 @@ impl LoadBalancer {
             if s.backend.is_isolated() || s.backend.is_removed() {
                 return false;
             }
-            let last_access = s.last_access_ms.load(Ordering::Acquire);
-            current_ms.saturating_sub(last_access) < ttl_ms
+            !slot_expired(current_ms, s.last_access_ms.load(Ordering::Acquire), ttl_ms)
         });
         slots.shrink_to_fit();
         
@@ -390,12 +411,14 @@ impl LoadBalancer {
         }
     }
 
-    fn start_sticky_maintainer(self: Arc<Self>) {
+    fn start_sticky_maintainer(self: Arc<Self>) -> JoinHandle<()> {
         let cancel_token = self.cancel_token.clone();
         let lb = self.clone();
-        
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
+            // 挂起恢复后不补跑历史 tick，只执行一次当前维护（Skip 只影响补跑方式）
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
             
             loop {
@@ -413,9 +436,9 @@ impl LoadBalancer {
                     }
                 }
             }
-        });
+        })
     }
-    
+
     fn check_warming_backends(&self, pool: &mut [Arc<Backend>]) {
         for backend in pool.iter() {
             if backend.check_warming_expired() {
@@ -603,6 +626,12 @@ impl LoadBalancer {
         self.cancel_token.cancel();
     }
 
+    /// 刷新"下次检查时刻"：给界面展示的倒计时用，墙上时钟，不参与任何调度判定
+    fn refresh_next_health_check_ms(&self) {
+        let next = now_ms() + get_global_config().health_check_interval.as_millis() as u64;
+        self.next_health_check_ms.store(next, Ordering::Relaxed);
+    }
+
     pub fn get_next_health_check_secs(&self) -> u64 {
         let next_ms = self.next_health_check_ms.load(Ordering::Relaxed);
         let current_ms = now_ms();
@@ -618,15 +647,19 @@ impl LoadBalancer {
         inner.backup.sort_by(|a, b| Backend::cmp_eviction(b, a));
     }
 
-    pub fn start_health_check(self: Arc<Self>) {
-        let Some(client) = self.client.read().clone() else { return };
+    /// 启动 sticky 维护与健康检查后台任务，返回全部句柄供实例登记；
+    /// URL 解析失败提前返回时，已启动的 sticky 维护句柄仍需交还
+    pub fn start_health_check(self: Arc<Self>) -> Vec<JoinHandle<()>> {
+        let mut handles = Vec::new();
 
-        self.clone().start_sticky_maintainer();
+        let Some(client) = self.client.read().clone() else { return handles };
+
+        handles.push(self.clone().start_sticky_maintainer());
 
         let cancel_token = self.cancel_token.clone();
 
-        let Some((_, host, scheme, path)) = crate::core::hyper::parse_url(&self.health_check_url) else { return };
-        
+        let Some((_, host, scheme, path)) = crate::core::hyper::parse_url(&self.health_check_url) else { return handles };
+
         let ping_config = PingConfig {
             tls_port: self.tls_port,
             http_port: self.http_port,
@@ -638,19 +671,24 @@ impl LoadBalancer {
             colo_filter: self.colo_filter.clone(),
         };
 
-        let current_ms = now_ms();
-        let hc = get_global_config().health_check_interval;
-        self.next_health_check_ms.store(current_ms + hc.as_millis() as u64, Ordering::Relaxed);
+        self.refresh_next_health_check_ms();
 
         let lb = self.clone();
-        tokio::spawn(async move {
+        let health_handle = tokio::spawn(async move {
             let mut backup_interval = tokio::time::interval(get_global_config().health_check_interval);
+            // 挂起恢复后不补跑历史 tick，只执行一次当前检查
+            backup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             backup_interval.tick().await;
             
             let mut primary_interval = tokio::time::interval(get_global_config().health_check_interval.saturating_mul(PRIMARY_CHECK_INTERVAL_MULT));
+            primary_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             primary_interval.tick().await;
 
-            let mut last_tick = std::time::SystemTime::now();
+            // 恢复校准的唯一入口：挂钟增量超过阈值即视为经历过挂起或校时，
+            // 一次性重建客户端、重置后端指标并刷新展示用的下次检查时刻。
+            // 两个时钟的增量一并记入日志，用于确认本平台上 Instant 是否计入挂起。
+            let mut last_wall = SystemTime::now();
+            let mut last_mono = Instant::now();
             const TIME_JUMP_THRESHOLD: Duration = Duration::from_secs(60);
 
             loop {
@@ -663,13 +701,19 @@ impl LoadBalancer {
                     _ = primary_interval.tick() => true,
                 };
 
-                let now = std::time::SystemTime::now();
-                if now.duration_since(last_tick).unwrap_or_default() > TIME_JUMP_THRESHOLD {
-                    push_log("INFO", "[健康检查] 检测到时间跳跃，重建客户端并重置后端指标");
+                let now = SystemTime::now();
+                let wall_delta = now.duration_since(last_wall).unwrap_or_default();
+                let mono_delta = last_mono.elapsed();
+                if wall_delta > TIME_JUMP_THRESHOLD {
+                    push_log("INFO", &format!(
+                        "[健康检查] 时间跳跃 wall={:?} mono={:?}，重建客户端并重置后端指标",
+                        wall_delta, mono_delta));
                     lb.rebuild_client();
                     lb.reset_all_metrics();
+                    lb.refresh_next_health_check_ms();
                 }
-                last_tick = now;
+                last_wall = now;
+                last_mono = Instant::now();
 
                 if is_primary {
                     lb.run_primary_health_check(ping_config.clone());
@@ -678,6 +722,9 @@ impl LoadBalancer {
                 }
             }
         });
+
+        handles.push(health_handle);
+        handles
     }
 
     fn run_health_check_for_pool(
@@ -696,8 +743,7 @@ impl LoadBalancer {
         
         if backends.is_empty() {
             if !is_primary {
-                let next_ms = now_ms() + get_global_config().health_check_interval.as_millis() as u64;
-                self.next_health_check_ms.store(next_ms, Ordering::Relaxed);
+                self.refresh_next_health_check_ms();
             }
             return;
         }
@@ -748,8 +794,7 @@ impl LoadBalancer {
                 lb.refill_from_backup();
             } else {
                 lb.sort_backup();
-                let current_ms = now_ms();
-                lb.next_health_check_ms.store(current_ms + get_global_config().health_check_interval.as_millis() as u64, Ordering::Relaxed);
+                lb.refresh_next_health_check_ms();
             }
         });
     }
@@ -859,5 +904,42 @@ impl LoadBalancer {
             }
             Action::None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 无 HTTP client 时不启动 sticky 维护任务；有 client 时至少交回 sticky 句柄
+    #[tokio::test]
+    async fn sticky_maintainer_requires_client() {
+        let lb = Arc::new(LoadBalancer::new(1));
+        assert!(lb.clone().start_health_check().is_empty());
+
+        let client = Arc::new(crate::core::build_hyper_client(500));
+        let lb = Arc::new(LoadBalancer::new(1).with_client(client));
+        assert!(!lb.clone().start_health_check().is_empty());
+    }
+
+    /// 单调毫秒与墙上时钟是两个时钟：前者随运行时间前进、量级远小于后者
+    #[test]
+    fn mono_ms_is_distinct_from_wall_clock() {
+        let a = mono_ms();
+        std::thread::sleep(Duration::from_millis(5));
+        let b = mono_ms();
+        assert!(b >= a + 5, "单调毫秒应随运行时间前进: {a} -> {b}");
+        assert!(b < now_ms(), "单调毫秒不应是墙上时钟");
+    }
+
+    /// TTL 判定要求同源时钟；混用时差值饱和为 0，槽会被误判为永不过期
+    #[test]
+    fn slot_expiry_requires_one_clock() {
+        assert!(slot_expired(60_000, 0, 15_000), "60s 前访问、TTL 15s 应过期");
+        assert!(!slot_expired(60_000, 55_000, 15_000), "5s 前访问不应过期");
+        assert!(
+            !slot_expired(1_000, 1_741_000_000_000, 15_000),
+            "单调毫秒与挂钟值混用时差值饱和为 0，判定失效"
+        );
     }
 }

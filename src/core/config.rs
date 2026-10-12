@@ -40,8 +40,8 @@ impl Config {
             warming_duration: Duration::from_secs(60),            // 新增 IP 预热时长
             sticky_base_interval: Duration::from_secs(10),        // Sticky 模式基础切换间隔
             sticky_increment_interval: Duration::from_secs(5),    // Sticky 每增加一个槽位的间隔增量
-            sticky_slot_ttl: Duration::from_secs(15),             // Sticky 槽位过期时间
-            sticky_slot_expand_interval: Duration::from_secs(10), // Sticky 槽位扩展检查间隔
+            sticky_slot_ttl: Duration::from_secs(15),             // Sticky 槽位过期时间（有效运行时长，不含系统挂起）
+            sticky_slot_expand_interval: Duration::from_secs(10), // Sticky 槽位扩展检查间隔（同上）
         }
     }
 }

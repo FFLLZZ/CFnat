@@ -20,7 +20,10 @@ struct StreamUpdate {
 pub async fn stream_updates(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(Duration::from_secs(1)))
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    // 挂起恢复后不补跑历史 tick，只推送一次当前状态
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let stream = tokio_stream::wrappers::IntervalStream::new(interval)
         .filter_map(move |_| {
             let update = StreamUpdate {
                 status: state.service.build_full_status(),
