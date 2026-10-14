@@ -125,7 +125,7 @@ jobs:
       - name: 安装 cargo-ndk 和 flutter_rust_bridge
         run: |
           cargo install cargo-ndk
-          cargo install flutter_rust_bridge_codegen
+          cargo install flutter_rust_bridge_codegen --version 2.12.0
 
       - name: 配置 Flutter 平台
         run: |
@@ -283,11 +283,11 @@ jobs:
 
       - name: 安装 flutter_rust_bridge (x64)
         if: steps.check_enabled.outputs.enabled == 'true' && matrix.arch == 'x64'
-        run: cargo install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version 2.12.0
 
       - name: 安装 flutter_rust_bridge (ARM64)
         if: steps.check_enabled.outputs.enabled == 'true' && matrix.arch == 'arm64'
-        run: cargo install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version 2.12.0
 
       - name: 清理旧生成文件
         if: steps.check_enabled.outputs.enabled == 'true'
@@ -488,7 +488,7 @@ jobs:
 
       - name: 安装 flutter_rust_bridge
         if: steps.check_enabled.outputs.enabled == 'true'
-        run: cargo install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version 2.12.0
 
       - name: 清理旧生成文件
         if: steps.check_enabled.outputs.enabled == 'true'
@@ -657,7 +657,7 @@ jobs:
 
       - name: 安装 flutter_rust_bridge
         if: steps.check_enabled.outputs.enabled == 'true'
-        run: cargo install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version 2.12.0
 
       - name: 清理旧生成文件
         if: steps.check_enabled.outputs.enabled == 'true' && matrix.arch == 'x64'
