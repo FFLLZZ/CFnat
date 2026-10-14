@@ -95,7 +95,9 @@ impl std::fmt::Display for ServiceError {
 }
 
 pub struct ServiceState {
-    phase: Mutex<Phase>,
+    /// 相位放在 Arc 下：stop 的清理任务独立于调用方 future 存续，
+    /// 需要在任务内改写相位
+    phase: Arc<Mutex<Phase>>,
     config: RwLock<ServiceConfig>,
 }
 
@@ -237,7 +239,7 @@ impl Default for ServiceState {
 impl ServiceState {
     pub fn new() -> Self {
         Self {
-            phase: Mutex::new(Phase::Stopped),
+            phase: Arc::new(Mutex::new(Phase::Stopped)),
             config: RwLock::new(ServiceConfig::default()),
         }
     }
@@ -451,7 +453,9 @@ impl ServiceState {
     }
 
     pub async fn stop(&self) -> Result<(), ServiceError> {
-        let instance = {
+        // 同步段一次持锁完成：相位切换、取消信号、连接关断、句柄摘取。
+        // 之后不再持有 MutexGuard await（保证 stop future 为 Send）
+        let mut handles = {
             let mut phase = self.phase.lock();
             match &*phase {
                 Phase::Running(_) => {}
@@ -464,31 +468,35 @@ impl ServiceState {
                 _ => unreachable!(),
             };
             *phase = Phase::Stopping;
-            inst
+
+            inst.cancel_token.cancel();
+            inst.lb.stop();
+            // 先关断全部存量连接，唤醒阻塞在读上的转发任务（含 Linux splice 线程）
+            inst.registry.shutdown_all();
+            let mut lock = inst.handles.lock();
+            std::mem::take(&mut *lock)
+            // 实例在此释放：句柄已摘出，其余资源由各任务持有的 Arc 延续
         };
 
-        instance.cancel_token.cancel();
-        instance.lb.stop();
-        // 先关断全部存量连接，唤醒阻塞在读上的转发任务（含 Linux splice 线程）
-        instance.registry.shutdown_all();
+        // 清理在独立任务中执行：调用方取消只取消等待，不取消清理本身，
+        // 相位最终仍收敛为 Stopped
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let phase = Arc::clone(&self.phase);
+        tokio::spawn(async move {
+            let stuck = await_handles(&mut handles, HANDLE_STOP_BUDGET).await;
+            if stuck > 0 {
+                push_log("WARN", &format!("停止超时，{} 个任务未自行退出，已强制终止", stuck));
+            }
+            *phase.lock() = Phase::Stopped;
+            push_log("INFO", "服务已停止");
+            let _ = done_tx.send(());
+        });
 
-        // 句柄取出后立刻归还锁，await 不持有 MutexGuard（保证 stop future 为 Send）
-        let stuck = {
-            let mut handles = {
-                let mut lock = instance.handles.lock();
-                std::mem::take(&mut *lock)
-            };
-            await_handles(&mut handles, HANDLE_STOP_BUDGET).await
-        };
-        if stuck > 0 {
-            push_log("WARN", &format!("停止超时，{} 个任务未自行退出，已强制终止", stuck));
+        match done_rx.await {
+            Ok(()) => Ok(()),
+            // 清理任务异常退出时相位可能停在 Stopping，不能向调用方报告"已停止"
+            Err(_) => Err(ServiceError::runtime("停止清理任务异常退出")),
         }
-
-        *self.phase.lock() = Phase::Stopped;
-
-        push_log("INFO", "服务已停止");
-
-        Ok(())
     }
 
     pub fn get_loadbalancer(&self) -> Option<Arc<LoadBalancer>> {
@@ -815,6 +823,49 @@ mod tests {
         assert!(!service.is_running(), "绑定失败后相位必须回滚为 Stopped");
 
         drop(occupied);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// stop 的调用方被取消后，清理任务继续执行：相位收敛为 Stopped，
+    /// 句柄被回收，服务可再次启动
+    #[test]
+    fn stop_cancellation_still_converges() {
+        let rt = test_runtime();
+        let (service, path) = service_with_ip_file("stop_cancel");
+
+        rt.block_on(async {
+            service.start().unwrap();
+            // 注入一个对取消信号无响应的任务，拉长 await_handles 的第一轮等待
+            match &*service.phase.lock() {
+                Phase::Running(inst) => inst.handles.lock().push(tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                })),
+                _ => panic!("启动后相位应为 Running"),
+            }
+
+            let stop_task = tokio::spawn({
+                let service = service.clone();
+                async move { service.stop().await }
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stop_task.abort();
+
+            // 相位最终收敛为 Stopped（卡住的任务由共享预算强制终止）
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if matches!(&*service.phase.lock(), Phase::Stopped) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "stop 调用被取消后相位未收敛");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(!service.is_running());
+
+            // 清理无遗留：可重新启动并正常停止
+            service.start().unwrap();
+            assert!(service.is_running());
+            service.stop().await.unwrap();
+        });
         std::fs::remove_file(&path).ok();
     }
 }
