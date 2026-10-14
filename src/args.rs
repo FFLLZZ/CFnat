@@ -78,14 +78,15 @@ impl Args {
                         .map_or(config.threads, |v| v.clamp(1, 1024));
                 }
                 "tp" => {
-                    config.tls_port = v_opt
-                        .and_then(|v| v.parse::<u16>().ok())
-                        .map_or(config.tls_port, |v| v.clamp(1, u16::MAX));
+                    // 端口不在此收窄，0 由 ServiceConfig::validate 显式拒绝
+                    if let Some(v) = v_opt.and_then(|v| v.parse::<u16>().ok()) {
+                        config.tls_port = v;
+                    }
                 }
                 "p" => {
-                    config.http_port = v_opt
-                        .and_then(|v| v.parse::<u16>().ok())
-                        .map_or(config.http_port, |v| v.clamp(1, u16::MAX));
+                    if let Some(v) = v_opt.and_then(|v| v.parse::<u16>().ok()) {
+                        config.http_port = v;
+                    }
                 }
                 "f" => {
                     if let Some(v) = v_opt {

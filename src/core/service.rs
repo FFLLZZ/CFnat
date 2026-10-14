@@ -181,7 +181,8 @@ pub struct ServiceConfig {
 
 impl ServiceConfig {
     // 各字段合法界与 args.rs 的 CLI 解析保持同一套（dl 1..=2000、tlr 0..=1、ips 1..=128、
-    // threads 1..=1024、端口 ≥1、sticky 槽 1..=32），两个入口不出现第二套规则
+    // threads 1..=1024、sticky 槽 1..=32），两个入口不出现第二套规则；
+    // 端口不在入口收窄，0 由 validate 显式拒绝
     pub fn apply_overrides(&mut self, overrides: &ConfigOverrides) {
         if let Some(v) = &overrides.ip_file { self.ip_file = v.clone(); }
         if let Some(v) = &overrides.http { self.http = v.clone(); }
@@ -189,8 +190,8 @@ impl ServiceConfig {
         if let Some(v) = overrides.tlr { self.tlr = v.clamp(0.0, 1.0); }
         if let Some(v) = overrides.ips { self.ips = v.clamp(1, 128); }
         if let Some(v) = overrides.threads { self.threads = v.clamp(1, 1024); }
-        if let Some(v) = overrides.tls_port { self.tls_port = v.max(1); }
-        if let Some(v) = overrides.http_port { self.http_port = v.max(1); }
+        if let Some(v) = overrides.tls_port { self.tls_port = v; }
+        if let Some(v) = overrides.http_port { self.http_port = v; }
         if let Some(v) = &overrides.colo { self.colo = Some(v.clone()); }
         if let Some(v) = overrides.addr { self.addr = v; }
         if let Some(v) = overrides.max_sticky_slots { self.max_sticky_slots = v.clamp(1, 32); }
@@ -201,6 +202,12 @@ impl ServiceConfig {
     /// 校验启动所需配置的语法与结构，不做网络可达性检查。
     /// 复用测速 / 健康检查的同一套 URL 解析，不引入第二套规则
     pub fn validate(&self) -> Result<(), ServiceError> {
+        if self.tls_port == 0 || self.http_port == 0 {
+            return Err(ServiceError::validation(format!(
+                "端口必须为 1..=65535（tls_port={}, http_port={}）",
+                self.tls_port, self.http_port
+            )));
+        }
         if crate::core::hyper::parse_url(&self.http).is_none() {
             return Err(ServiceError::validation(
                 format!("测速地址无效（需包含 scheme 与 host）: {}", self.http),
@@ -509,7 +516,8 @@ impl ServiceState {
 mod tests {
     use super::*;
 
-    /// 覆盖层与 CLI（args.rs）必须落在同一套界内，防止入口规则分裂
+    /// 覆盖层与 CLI（args.rs）必须落在同一套界内，防止入口规则分裂；
+    /// 端口不在入口收窄，0 交给 validate 拒绝
     #[test]
     fn overrides_clamp_to_cli_bounds() {
         let mut config = ServiceConfig::default();
@@ -527,9 +535,10 @@ mod tests {
         assert_eq!(config.tlr, 1.0);
         assert_eq!(config.ips, 1);
         assert_eq!(config.threads, 1024);
-        assert_eq!(config.tls_port, 1);
-        assert_eq!(config.http_port, 1);
+        assert_eq!(config.tls_port, 0);
+        assert_eq!(config.http_port, 0);
         assert_eq!(config.max_sticky_slots, 1);
+        assert!(config.validate().is_err(), "端口 0 应被校验拒绝");
 
         config.apply_overrides(&ConfigOverrides {
             delay_limit: Some(999999),
@@ -540,6 +549,10 @@ mod tests {
         assert_eq!(config.delay_limit, 2000);
         assert_eq!(config.ips, 128);
         assert_eq!(config.max_sticky_slots, 32);
+
+        config.tls_port = 1;
+        config.http_port = 1;
+        assert!(config.validate().is_ok(), "端口落在 1..=65535 应通过校验");
     }
 
     /// 启动前校验只认 URL 语法与结构：缺 scheme 或整体不可解析都拒绝
