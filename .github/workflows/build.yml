@@ -126,8 +126,8 @@ jobs:
           [[ "${{ inputs.build_linux_arm64 }}"   == true ]] && arr+=('{"os":"Linux","arch":"ARM64","target":"aarch64-unknown-linux-musl","runner":"ubuntu-latest","bin":"${{ inputs.project_name }}"}')
           [[ "${{ inputs.build_linux_amd64_gnu }}" == true ]] && arr+=('{"os":"Linux","arch":"AMD64_GNU","target":"x86_64-unknown-linux-gnu","runner":"ubuntu-latest","bin":"${{ inputs.project_name }}"}')
           [[ "${{ inputs.build_linux_arm64_gnu }}" == true ]] && arr+=('{"os":"Linux","arch":"ARM64_GNU","target":"aarch64-unknown-linux-gnu","runner":"ubuntu-latest","bin":"${{ inputs.project_name }}"}')
-          [[ "${{ inputs.build_macos_amd64 }}"   == true ]] && arr+=('{"os":"MacOS","arch":"AMD64","target":"x86_64-apple-darwin","runner":"ubuntu-latest","bin":"${{ inputs.project_name }}"}')
-          [[ "${{ inputs.build_macos_arm64 }}"   == true ]] && arr+=('{"os":"MacOS","arch":"ARM64","target":"aarch64-apple-darwin","runner":"ubuntu-latest","bin":"${{ inputs.project_name }}"}')
+          [[ "${{ inputs.build_macos_amd64 }}"   == true ]] && arr+=('{"os":"MacOS","arch":"AMD64","target":"x86_64-apple-darwin","runner":"macos-26-intel","bin":"${{ inputs.project_name }}"}')
+          [[ "${{ inputs.build_macos_arm64 }}"   == true ]] && arr+=('{"os":"MacOS","arch":"ARM64","target":"aarch64-apple-darwin","runner":"macos-latest","bin":"${{ inputs.project_name }}"}')
           echo "include=[$(IFS=,; echo "${arr[*]}")]" >> $GITHUB_OUTPUT
 
   build:
@@ -156,6 +156,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: 安装 Zig
+        if: ${{ matrix.os == 'Linux' && startsWith(matrix.target, 'aarch64-') }}
         uses: mlugg/setup-zig@v2
         with:
           version: master
@@ -167,11 +168,11 @@ jobs:
             FEATURES="web,flutter-web"
           fi
           cargo update
-          if [[ "${{ matrix.os }}" == "Windows" ]]; then
-            cmd="build"
-          else
+          if [[ "${{ matrix.os }}" == "Linux" && "${{ matrix.target }}" == aarch64-* ]]; then
             cargo install --locked cargo-zigbuild
             cmd="zigbuild"
+          else
+            cmd="build"
           fi
           cargo $cmd --release --features "$FEATURES" --target ${{ matrix.target }}
         shell: bash

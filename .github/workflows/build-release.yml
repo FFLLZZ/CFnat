@@ -427,13 +427,11 @@ jobs:
           - arch: x64
             runner: ubuntu-latest
             rust_target: x86_64-unknown-linux-gnu
-            use_zig: true
             appimage_arch: x86_64
             flutter_bundle_dir: x64/release/bundle
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             rust_target: aarch64-unknown-linux-gnu
-            use_zig: false
             appimage_arch: aarch64
             flutter_bundle_dir: arm64/release/bundle
     steps:
@@ -477,12 +475,6 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      - name: 安装 Zig (x64)
-        if: steps.check_enabled.outputs.enabled == 'true' && matrix.use_zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: master
-
       - name: 安装系统依赖
         if: steps.check_enabled.outputs.enabled == 'true'
         run: |
@@ -494,14 +486,8 @@ jobs:
           fi
           sudo gem install fpm
 
-      - name: 安装 Rust 工具 (x64)
-        if: steps.check_enabled.outputs.enabled == 'true' && matrix.use_zig
-        run: |
-          cargo install --locked cargo-zigbuild
-          cargo install flutter_rust_bridge_codegen
-
-      - name: 安装 Rust 工具 (ARM64)
-        if: steps.check_enabled.outputs.enabled == 'true' && '!matrix.use_zig'
+      - name: 安装 flutter_rust_bridge
+        if: steps.check_enabled.outputs.enabled == 'true'
         run: cargo install flutter_rust_bridge_codegen
 
       - name: 清理旧生成文件
@@ -524,17 +510,11 @@ jobs:
           flutter pub get
           flutter_rust_bridge_codegen generate
 
-      - name: 编译 Rust 库 (x64)
-        if: steps.check_enabled.outputs.enabled == 'true' && matrix.use_zig
+      - name: 编译 Rust 库
+        if: steps.check_enabled.outputs.enabled == 'true'
         run: |
           cd flutter/rust
-          cargo zigbuild --release --target ${{ matrix.rust_target }}
-
-      - name: 编译 Rust 库 (ARM64)
-        if: steps.check_enabled.outputs.enabled == 'true' && '!matrix.use_zig'
-        run: |
-          cd flutter/rust
-          cargo build --release
+          cargo build --release --target ${{ matrix.rust_target }}
 
       - name: 构建 Linux
         if: steps.check_enabled.outputs.enabled == 'true'
@@ -560,11 +540,7 @@ jobs:
           echo "BUNDLE_DIR=$BUNDLE_DIR" >> $GITHUB_OUTPUT
           
           mkdir -p "$BUNDLE_DIR/lib"
-          if [ "${{ matrix.arch }}" == "x64" ]; then
-            cp flutter/rust/target/${{ matrix.rust_target }}/release/lib${{ env.RUST_LIB_NAME }}.so "$BUNDLE_DIR/lib/"
-          else
-            cp flutter/rust/target/release/lib${{ env.RUST_LIB_NAME }}.so "$BUNDLE_DIR/lib/"
-          fi
+          cp flutter/rust/target/${{ matrix.rust_target }}/release/lib${{ env.RUST_LIB_NAME }}.so "$BUNDLE_DIR/lib/"
 
       - name: 打包 tar.gz、deb、rpm
         if: steps.check_enabled.outputs.enabled == 'true'
@@ -636,14 +612,16 @@ jobs:
     name: 构建 macOS ${{ matrix.arch }}
     needs: [validate_version]
     if: ${{ inputs.build_macos_x64 || inputs.build_macos_arm64 }}
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x64
+            runner: macos-26-intel
             rust_target: x86_64-apple-darwin
           - arch: arm64
+            runner: macos-latest
             rust_target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
@@ -673,21 +651,13 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
-      - name: 安装 Zig
-        if: steps.check_enabled.outputs.enabled == 'true'
-        uses: mlugg/setup-zig@v2
-        with:
-          version: master
-
       - name: 安装 LLVM
         if: steps.check_enabled.outputs.enabled == 'true'
         run: brew install llvm
 
-      - name: 安装 cargo-zigbuild 和 flutter_rust_bridge
+      - name: 安装 flutter_rust_bridge
         if: steps.check_enabled.outputs.enabled == 'true'
-        run: |
-          cargo install --locked cargo-zigbuild
-          cargo install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen
 
       - name: 清理旧生成文件
         if: steps.check_enabled.outputs.enabled == 'true' && matrix.arch == 'x64'
@@ -725,7 +695,7 @@ jobs:
         if: steps.check_enabled.outputs.enabled == 'true'
         run: |
           cd flutter/rust
-          cargo zigbuild --release --target ${{ matrix.rust_target }}
+          cargo build --release --target ${{ matrix.rust_target }}
 
       - name: 构建 macOS
         if: steps.check_enabled.outputs.enabled == 'true'
