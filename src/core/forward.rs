@@ -360,20 +360,18 @@ async fn handle_client(
 }
 
 pub async fn run_forward(
-    addr: SocketAddr,
+    listener: TcpListener,
     lb: Arc<LoadBalancer>,
     tls_port: u16,
     http_port: u16,
     cancel_token: CancellationToken,
     registry: Arc<ConnectionRegistry>,
-) -> io::Result<SocketAddr> {
-    let listener = TcpListener::bind(addr).await?;
+) -> io::Result<()> {
     let local_addr = listener.local_addr()?;
     let warned = Arc::new(AtomicBool::new(false));
     push_log("INFO", &format!("转发服务 {} (TLS:{}, HTTP:{})", local_addr, tls_port, http_port));
 
-    // 连续 accept 失败的两个独立度量：退避档位用失败次数，故障升级用失败持续时长
-    let mut consecutive_failures: u32 = 0;
+    // 连续 accept 失败：退避档位与故障升级共用同一个恢复窗口
     let mut failure_streak = accept_error::FailureStreak::default();
 
     loop {
@@ -381,7 +379,6 @@ pub async fn run_forward(
             res = listener.accept() => {
                 match res {
                     Ok((client, _)) => {
-                        consecutive_failures = 0;
                         failure_streak.clear();
                         // 克隆失败（fd 耗尽）的连接无法纳入 stop 回收，直接断开
                         let Some(conn_id) = registry.register(&client) else {
@@ -403,24 +400,19 @@ pub async fn run_forward(
                     }
                     Err(e) => {
                         match accept_error::classify(&e) {
-                            AcceptAction::Fatal => {
-                                return Err(io::Error::new(e.kind(), accept_error::describe(&e)));
-                            }
+                            // 交回原始错误：describe 只在日志与故障出口调用一次，
+                            // 重建 io::Error 会丢掉 raw_os_error
+                            AcceptAction::Fatal => return Err(e),
                             action => {
-                                // 持续失败达到阈值即升级为故障，与退避档位各自独立
-                                let elapsed = failure_streak.record(Instant::now());
-                                if elapsed >= accept_error::ESCALATE_AFTER {
-                                    return Err(io::Error::new(
-                                        e.kind(),
-                                        format!(
-                                            "accept 连续失败超过 {:?}：{}",
-                                            accept_error::ESCALATE_AFTER,
-                                            accept_error::describe(&e)
-                                        ),
+                                let sample = failure_streak.record(Instant::now());
+                                if sample.elapsed >= accept_error::ESCALATE_AFTER {
+                                    push_log("ERROR", &format!(
+                                        "accept 连续失败超过 {:?}，放弃转发",
+                                        accept_error::ESCALATE_AFTER
                                     ));
+                                    return Err(e);
                                 }
-                                let delay = accept_error::backoff_delay(action, consecutive_failures);
-                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                let delay = accept_error::backoff_delay(action, sample.prior);
                                 // 退避期间仍响应停止信号
                                 if tokio::time::timeout(delay, cancel_token.cancelled()).await.is_ok() {
                                     push_log("INFO", "[转发服务] 收到停止信号，退出");
@@ -437,7 +429,7 @@ pub async fn run_forward(
             }
         }
     }
-    Ok(local_addr)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -477,17 +469,15 @@ mod tests {
         let registry = Arc::new(ConnectionRegistry::new());
         let token = CancellationToken::new();
 
-        // run_forward 只在 cancel 后返回，无法用 oneshot 回传绑定地址；
-        // 改为先探测空闲端口，释放后由 run_forward 绑定同一端口
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
+        // 绑定由调用方完成：监听地址可直接取自 listener，无需先探测再释放
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
         let port = backend.port();
         tokio::spawn({
             let registry = registry.clone();
             let token = token.clone();
             async move {
-                run_forward(addr, lb, port, port, token, registry)
+                run_forward(listener, lb, port, port, token, registry)
                     .await
                     .unwrap();
             }

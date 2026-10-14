@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RwLock};
+use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use crate::core::{IpPool, LoadBalancer, HttpingConfig, build_hyper_client, run_continuous_httping, run_forward, CancellationToken, ConnectionRegistry};
@@ -80,6 +81,11 @@ impl ServiceError {
     fn lifecycle(message: impl Into<String>) -> Self {
         Self { category: ErrorCategory::Lifecycle, message: message.into() }
     }
+
+    /// 启动阶段可同步判定的运行期失败（资源、绑定等）
+    fn runtime(message: impl Into<String>) -> Self {
+        Self { category: ErrorCategory::Runtime, message: message.into() }
+    }
 }
 
 impl std::fmt::Display for ServiceError {
@@ -138,6 +144,20 @@ async fn await_handles(handles: &mut [JoinHandle<()>], budget: Duration) -> usiz
         ));
     }
     count
+}
+
+/// 同步绑定监听端口。绑定失败在启动阶段返回给调用方，因此不产生任何后台任务，
+/// 也不需要走故障槽；转发任务只负责"绑定成功之后"的失败
+fn bind_listener(addr: SocketAddr) -> Result<TcpListener, ServiceError> {
+    let listener = std::net::TcpListener::bind(addr).map_err(|e| {
+        ServiceError::runtime(format!("端口 {} 无法绑定：{}", addr, accept_error::describe(&e)))
+    })?;
+    listener.set_nonblocking(true).map_err(|e| {
+        ServiceError::runtime(format!("端口 {} 切换非阻塞失败：{}", addr, accept_error::describe(&e)))
+    })?;
+    TcpListener::from_std(listener).map_err(|e| {
+        ServiceError::runtime(format!("端口 {} 注册到运行时失败：{}", addr, accept_error::describe(&e)))
+    })
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -342,6 +362,9 @@ impl ServiceState {
     /// 守卫在此被消费，之后相位由 Phase::Running 承接。
     /// 配置取自入口处已校验的那一份，不在此重新读取，避免校验过的值与实际使用的值不一致
     fn finish_start(&self, config: ServiceConfig, ip_pool: Arc<IpPool>, guard: StartGuard<'_>) -> Result<(), ServiceError> {
+        // 先绑定：失败即返回，此时尚未产生任何后台任务
+        let listener = bind_listener(config.addr)?;
+
         // 启动前清空旧日志并重置时间基准
         reset_start_time();
         get_log_buffer().clear();
@@ -375,7 +398,6 @@ impl ServiceState {
         let tls_port = config.tls_port;
         let http_port = config.http_port;
         let delay_limit = config.delay_limit;
-        let addr = config.addr;
         let cancel_token_for_httping = cancel_token.clone();
 
         let httping_handle: JoinHandle<()> = tokio::spawn(async move {
@@ -406,7 +428,7 @@ impl ServiceState {
         let forward_fault_task = forward_fault.clone();
 
         let forward_handle: JoinHandle<()> = tokio::spawn(async move {
-            if let Err(e) = run_forward(addr, lb_forward, tls_port, http_port, forward_cancel_token, registry_forward).await {
+            if let Err(e) = run_forward(listener, lb_forward, tls_port, http_port, forward_cancel_token, registry_forward).await {
                 let reason = accept_error::describe(&e);
                 // 先落故障信息再记日志：状态读取只依赖槽位，不依赖日志
                 record_forward_fault(&forward_fault_task, reason.clone());
@@ -724,28 +746,18 @@ mod tests {
         let rt = test_runtime();
         let (service, path) = service_with_ip_file("forward_fault");
 
-        // 占住目标端口，使 run_forward 的 bind 立即失败（std 在 Windows 上不设 SO_REUSEADDR，
-        // 在 Linux 上 SO_REUSEADDR 也不能与处于 LISTEN 的 socket 共存）
-        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        {
-            let mut config = service.get_config();
-            config.addr = occupied.local_addr().unwrap();
-            service.update_config(config);
-        }
-
         let _guard = rt.handle().enter();
         service.start().unwrap();
+        assert!(service.build_full_status().running, "启动后应报告运行中");
 
-        // 等转发任务落地并写入故障槽
-        rt.block_on(async {
-            for _ in 0..200 {
-                if !service.build_full_status().running {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        // 直接置位故障槽，模拟 accept 循环在启动之后异常退出。
+        // 绑定失败已由 finish_start 同步返回，不再经过故障槽
+        match &*service.phase.lock() {
+            Phase::Running(inst) => {
+                record_forward_fault(&inst.forward_fault, "模拟转发故障".to_string())
             }
-            panic!("转发任务未在 2 秒内进入故障状态");
-        });
+            _ => panic!("启动后相位应为 Running"),
+        }
 
         let info = service.build_full_status();
         assert!(!info.running, "转发任务已退出，不应再报告运行中");
@@ -760,8 +772,7 @@ mod tests {
         assert!(!service.is_running());
         assert!(!service.build_full_status().running);
 
-        // stop 完成后端口已释放，可重新启动并重新绑定
-        drop(occupied);
+        // stop 完成后端口已释放，可重新启动并重新绑定；新实例的故障槽是空的
         service.start().unwrap();
         assert!(service.build_full_status().running, "重启后应恢复为正常运行");
         rt.block_on(service.stop()).unwrap();
@@ -774,15 +785,16 @@ mod tests {
         let rt = test_runtime();
         let (service, path) = service_with_ip_file("snapshot");
 
-        // 占住一个端口：快照用它作绑定地址 ⇒ 必然 bind 失败
+        // 占住一个端口：快照用它作绑定地址 ⇒ 绑定必然失败并同步返回
         let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
         let snapshot = {
             let mut config = service.get_config();
-            config.addr = occupied.local_addr().unwrap();
+            config.addr = occupied_addr;
             config
         };
         {
-            // 与快照不同的"当前配置"：地址可用，若被使用则转发不会落到故障态
+            // 与快照不同的"当前配置"：地址可用，若被使用则绑定会成功
             let mut live = service.get_config();
             live.addr = "127.0.0.1:0".parse().unwrap();
             service.update_config(live);
@@ -791,20 +803,17 @@ mod tests {
         let _guard = rt.handle().enter();
         let guard = service.begin_start().unwrap();
         let ip_pool = Arc::new(IpPool::from_file(&snapshot.ip_file));
-        service.finish_start(snapshot, ip_pool, guard).unwrap();
+        let err = service.finish_start(snapshot, ip_pool, guard).unwrap_err();
 
-        // 落入故障 ⇒ 使用的是快照里那个被占用的地址
-        rt.block_on(async {
-            for _ in 0..200 {
-                if !service.build_full_status().running {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            panic!("启动未使用已校验的快照：当前配置本可正常绑定");
-        });
+        // 报的是快照里那个被占用的地址 ⇒ 使用的是快照，而非当前配置
+        assert_eq!(err.category, ErrorCategory::Runtime);
+        assert!(
+            err.message.contains(&occupied_addr.to_string()),
+            "错误应指向快照地址 {occupied_addr}，实际: {}",
+            err.message
+        );
+        assert!(!service.is_running(), "绑定失败后相位必须回滚为 Stopped");
 
-        rt.block_on(service.stop()).unwrap();
         drop(occupied);
         std::fs::remove_file(&path).ok();
     }

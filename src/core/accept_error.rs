@@ -21,113 +21,141 @@ const BACKOFF_MAX: Duration = Duration::from_millis(1000);
 /// 退避翻倍次数上限
 const BACKOFF_MAX_SHIFT: u32 = 5;
 
-/// 连续失败持续到该时长即升级为故障；与退避档位使用的失败次数是两个独立度量
+/// 连续失败持续到该时长即升级为故障
 pub(crate) const ESCALATE_AFTER: Duration = Duration::from_secs(30);
 
-/// 连续失败时段内允许的相邻失败最大间隔：超过它即视为上一段失败已结束。
-/// 取最大退避（BACKOFF_MAX）的 5 倍，任何超过它的空档都说明失败流已中断
-pub(crate) const FAILURE_IDLE_GAP: Duration = Duration::from_millis(5000);
+/// 连续失败的恢复窗口：相邻两次失败的间隔超过它即视为上一段失败已结束，
+/// 段内计数与持续时长同时归零。上限独立于 BACKOFF_MAX（退避上限），
+/// 本身不再随时间增长
+pub(crate) const FAILURE_RECOVERY_WINDOW: Duration = Duration::from_millis(5000);
 
-/// accept 连续失败的计时：只有相邻失败间隔不超过 FAILURE_IDLE_GAP 才属同一段，
-/// 一段失败持续到 ESCALATE_AFTER 即应升级为故障
+/// 一次失败在"连续失败段"内所处的位置。段由 FAILURE_RECOVERY_WINDOW 界定
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FailureSample {
+    /// 本段从首次失败到本次的持续时长
+    pub elapsed: Duration,
+    /// 本次之前本段已发生的失败次数，退避档位用它（从 0 起）
+    pub prior: u32,
+}
+
+/// accept 连续失败的计时：相邻失败间隔不超过 FAILURE_RECOVERY_WINDOW 才属同一段
 #[derive(Default)]
 pub(crate) struct FailureStreak {
     start: Option<Instant>,
     last: Option<Instant>,
+    count: u32,
 }
 
 impl FailureStreak {
-    /// 记录一次失败，返回当前这一段失败已持续的时长。
-    /// 与上次失败的间隔超过 FAILURE_IDLE_GAP 时重新起算
-    pub(crate) fn record(&mut self, now: Instant) -> Duration {
+    /// 记录一次失败。与上次失败的间隔超过 FAILURE_RECOVERY_WINDOW 时开启新的一段，
+    /// 计数与起算点一并重置，退避档位回到起点
+    pub(crate) fn record(&mut self, now: Instant) -> FailureSample {
         let continued = self
             .last
-            .is_some_and(|prev| now.duration_since(prev) <= FAILURE_IDLE_GAP);
-        let start = if continued { self.start.unwrap_or(now) } else { now };
-        self.start = Some(start);
-        self.last = Some(now);
-        now.duration_since(start)
+            .is_some_and(|prev| now.duration_since(prev) <= FAILURE_RECOVERY_WINDOW);
+        if continued {
+            let elapsed = now.duration_since(self.start.unwrap_or(now));
+            let prior = self.count;
+            self.last = Some(now);
+            self.count = self.count.saturating_add(1);
+            FailureSample { elapsed, prior }
+        } else {
+            self.start = Some(now);
+            self.last = Some(now);
+            self.count = 1;
+            FailureSample { elapsed: Duration::ZERO, prior: 0 }
+        }
     }
 
     /// 记录一次成功接受：当前失败段结束，下次失败重新起算
     pub(crate) fn clear(&mut self) {
         self.start = None;
         self.last = None;
+        self.count = 0;
     }
 }
 
-/// 判定 accept 错误类别。输入取 `io::Error::raw_os_error()`：
-/// Linux 为 errno，Windows 为 Winsock WSA 码。两者取值不重叠
-/// （errno < 200，WSA 码 >= 10000），因此同一张表同时容纳两边，
-/// 任一平台上都能覆盖另一平台的映射。
+/// 判定 accept 错误类别。语义分类走 io::ErrorKind：std 按目标平台把系统错误码
+/// 映射到 ErrorKind，各平台取值差异（如 ECONNABORTED 在 macOS 为 53、Linux 为 103）
+/// 由 std 处理，本函数不持有任何手写数值表。std 未归类到具体 ErrorKind 的错误
+/// （主要是 fd / 内核缓冲耗尽）由平台专属原始码补充判定
 pub(crate) fn classify(err: &io::Error) -> AcceptAction {
-    match err.raw_os_error() {
-        Some(code) => classify_code(code),
-        // 无 OS 错误码（自定义 io::Error 等）无法判断，按故障处理
-        None => AcceptAction::Fatal,
+    match err.kind() {
+        // 只影响等待中的那个连接，或已排队的网络错误：退避后重试
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::Interrupted
+        | io::ErrorKind::WouldBlock
+        | io::ErrorKind::TimedOut
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::HostUnreachable
+        | io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::NetworkDown => AcceptAction::Retry,
+        // 内存不足：需要更长退避
+        io::ErrorKind::OutOfMemory => AcceptAction::Backoff,
+        // 监听 socket 或进程状态已损坏，重试无意义
+        io::ErrorKind::PermissionDenied
+        | io::ErrorKind::InvalidInput
+        | io::ErrorKind::AddrInUse
+        | io::ErrorKind::AddrNotAvailable => AcceptAction::Fatal,
+        // ErrorKind 未给出可区分语义的错误（std 归入 Uncategorized，或
+        // Unsupported 同时覆盖 EOPNOTSUPP 与 ENOSYS 两种相反语义）：
+        // 按平台原始码补充；无原始码或无法识别的一律按故障处理
+        _ => match err.raw_os_error() {
+            Some(code) => classify_raw(code),
+            None => AcceptAction::Fatal,
+        },
     }
 }
 
-fn classify_code(code: i32) -> AcceptAction {
+/// ErrorKind 无法区分的错误按平台原始码判定
+#[cfg(target_os = "linux")]
+fn classify_raw(code: i32) -> AcceptAction {
     match code {
-        // Linux errno：accept(2) 要求"像 EAGAIN 一样重试"的已排队网络错误
-        103     // ECONNABORTED
-        | 71    // EPROTO
-        | 100   // ENETDOWN
-        | 92    // ENOPROTOOPT
-        | 112   // EHOSTDOWN
-        | 64    // ENONET
-        | 113   // EHOSTUNREACH
-        | 95    // EOPNOTSUPP
-        | 101   // ENETUNREACH
-        | 4     // EINTR：std 的 cvt_r 已重试，保留以防上层改动
-        | 11    // EAGAIN/EWOULDBLOCK：tokio 的 async_io 已吞，保留同上
-        => AcceptAction::Retry,
-        24      // EMFILE
-        | 23    // ENFILE
-        | 105   // ENOBUFS
-        | 12    // ENOMEM
-        => AcceptAction::Backoff,
-        9       // EBADF
-        | 88    // ENOTSOCK
-        | 22    // EINVAL
-        | 1     // EPERM：防火墙拒绝，重试无意义
-        => AcceptAction::Fatal,
-
-        // Windows WSA：数值取自 std 自带的 Windows 绑定
-        10053   // WSAECONNABORTED
-        | 10054 // WSAECONNRESET
-        | 10004 // WSAEINTR
-        | 10035 // WSAEWOULDBLOCK
-        | 10050 // WSAENETDOWN
-        | 10051 // WSAENETUNREACH
-        | 10052 // WSAENETRESET
-        | 10065 // WSAEHOSTUNREACH
-        | 10060 // WSAETIMEDOUT
-        | 10045 // WSAEOPNOTSUPP
-        | 10036 // WSAEINPROGRESS
-        => AcceptAction::Retry,
-        10024   // WSAEMFILE
-        | 10055 // WSAENOBUFS
-        => AcceptAction::Backoff,
-        10038   // WSAENOTSOCK
-        | 10022 // WSAEINVAL
-        | 10009 // WSAEBADF
-        | 10013 // WSAEACCES
-        => AcceptAction::Fatal,
-
-        // 未知错误码：由调用方带原始码记录后按故障处理
+        // accept(2)：内核把已排队连接上的网络错误直接透传，要求按 EAGAIN 重试
+        71 /* EPROTO */ | 92 /* ENOPROTOOPT */ | 112 /* EHOSTDOWN */
+        | 64 /* ENONET */ | 95 /* EOPNOTSUPP */ => AcceptAction::Retry,
+        // fd / 内核缓冲耗尽
+        24 /* EMFILE */ | 23 /* ENFILE */ | 105 /* ENOBUFS */ => AcceptAction::Backoff,
         _ => AcceptAction::Fatal,
     }
 }
 
-/// 第 `consecutive_failures` 次连续失败（从 0 起）之后的退避时长
-pub(crate) fn backoff_delay(action: AcceptAction, consecutive_failures: u32) -> Duration {
+/// ErrorKind 无法区分的错误按平台原始码判定。
+/// BSD 系不透传已排队连接的网络错误，因此这里只需补 fd / 缓冲耗尽
+#[cfg(target_vendor = "apple")]
+fn classify_raw(code: i32) -> AcceptAction {
+    match code {
+        24 /* EMFILE */ | 23 /* ENFILE */ | 55 /* ENOBUFS */ => AcceptAction::Backoff,
+        _ => AcceptAction::Fatal,
+    }
+}
+
+/// ErrorKind 无法区分的错误按平台原始码判定
+#[cfg(target_os = "windows")]
+fn classify_raw(code: i32) -> AcceptAction {
+    match code {
+        10004 /* WSAEINTR */ | 10036 /* WSAEINPROGRESS */
+        | 10045 /* WSAEOPNOTSUPP */ | 10052 /* WSAENETRESET */ => AcceptAction::Retry,
+        10024 /* WSAEMFILE */ | 10055 /* WSAENOBUFS */ => AcceptAction::Backoff,
+        _ => AcceptAction::Fatal,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple", target_os = "windows")))]
+fn classify_raw(_code: i32) -> AcceptAction {
+    AcceptAction::Fatal
+}
+
+/// 本段内第 `prior_failures`（从 0 起）次失败之后的退避时长
+pub(crate) fn backoff_delay(action: AcceptAction, prior_failures: u32) -> Duration {
     let base = match action {
         AcceptAction::Backoff => BACKOFF_BASE,
         _ => RETRY_BASE,
     };
-    let shift = consecutive_failures.min(BACKOFF_MAX_SHIFT);
+    let shift = prior_failures.min(BACKOFF_MAX_SHIFT);
     base.saturating_mul(1 << shift).min(BACKOFF_MAX)
 }
 
@@ -146,52 +174,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn linux_transient_errors_are_retried() {
-        for code in [103, 71, 100, 92, 112, 64, 113, 95, 101, 4, 11] {
-            assert_eq!(classify_code(code), AcceptAction::Retry, "errno {code}");
+    fn transient_kinds_are_retried() {
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::NetworkDown,
+        ] {
+            assert_eq!(classify(&io::Error::new(kind, "x")), AcceptAction::Retry, "{kind:?}");
         }
     }
 
     #[test]
-    fn linux_resource_exhaustion_uses_backoff() {
-        for code in [24, 23, 105, 12] {
-            assert_eq!(classify_code(code), AcceptAction::Backoff, "errno {code}");
+    fn broken_listener_kinds_are_fatal() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::AddrInUse,
+            io::ErrorKind::AddrNotAvailable,
+        ] {
+            assert_eq!(classify(&io::Error::new(kind, "x")), AcceptAction::Fatal, "{kind:?}");
         }
     }
 
     #[test]
-    fn linux_broken_listener_is_fatal() {
-        for code in [9, 88, 22, 1] {
-            assert_eq!(classify_code(code), AcceptAction::Fatal, "errno {code}");
-        }
+    fn out_of_memory_uses_backoff() {
+        assert_eq!(
+            classify(&io::Error::new(io::ErrorKind::OutOfMemory, "x")),
+            AcceptAction::Backoff
+        );
     }
 
     #[test]
-    fn windows_transient_errors_are_retried() {
-        for code in [10053, 10054, 10004, 10035, 10050, 10051, 10052, 10065, 10060, 10045, 10036] {
-            assert_eq!(classify_code(code), AcceptAction::Retry, "WSA {code}");
-        }
-    }
-
-    #[test]
-    fn windows_resource_exhaustion_uses_backoff() {
-        for code in [10024, 10055] {
-            assert_eq!(classify_code(code), AcceptAction::Backoff, "WSA {code}");
-        }
-    }
-
-    #[test]
-    fn windows_broken_listener_is_fatal() {
-        for code in [10038, 10022, 10009, 10013] {
-            assert_eq!(classify_code(code), AcceptAction::Fatal, "WSA {code}");
-        }
-    }
-
-    #[test]
-    fn unknown_codes_are_fatal() {
-        assert_eq!(classify_code(0), AcceptAction::Fatal);
-        assert_eq!(classify_code(12345), AcceptAction::Fatal);
-        assert_eq!(classify_code(-1), AcceptAction::Fatal);
+    fn unresolvable_errors_are_fatal() {
+        // 0 与 12345 在 std 的映射里都落到 Uncategorized，且不属于任何补充表
+        assert_eq!(classify(&io::Error::from_raw_os_error(0)), AcceptAction::Fatal);
+        assert_eq!(classify(&io::Error::from_raw_os_error(12345)), AcceptAction::Fatal);
+        // 无原始码的自定义错误无法判断，同样按故障处理
+        assert_eq!(classify(&io::Error::other("x")), AcceptAction::Fatal);
     }
 
     #[test]
@@ -210,13 +237,47 @@ mod tests {
         assert_eq!(seq, vec![200, 400, 800, 1000, 1000, 1000, 1000]);
     }
 
+    /// 平台补充表只在本平台可验证：数值本身就带平台语义
+    #[cfg(target_os = "linux")]
     #[test]
-    fn classify_reads_raw_os_error() {
-        assert_eq!(classify(&io::Error::from_raw_os_error(24)), AcceptAction::Backoff);
-        assert_eq!(classify(&io::Error::from_raw_os_error(10024)), AcceptAction::Backoff);
-        assert_eq!(classify(&io::Error::from_raw_os_error(103)), AcceptAction::Retry);
-        assert_eq!(classify(&io::Error::from_raw_os_error(10054)), AcceptAction::Retry);
-        assert_eq!(classify(&io::Error::other("x")), AcceptAction::Fatal);
+    fn linux_raw_supplements_follow_accept_man_page() {
+        // 内核透传的已排队网络错误，按 EAGAIN 处理
+        for code in [71, 92, 112, 64, 95] {
+            assert_eq!(classify(&io::Error::from_raw_os_error(code)), AcceptAction::Retry, "errno {code}");
+        }
+        for code in [24, 23, 105] {
+            assert_eq!(classify(&io::Error::from_raw_os_error(code)), AcceptAction::Backoff, "errno {code}");
+        }
+        // EBADF / ENOTSOCK 不被 std 归类，ENOSYS 与 EOPNOTSUPP 共享 Unsupported
+        for code in [9, 88, 38] {
+            assert_eq!(classify(&io::Error::from_raw_os_error(code)), AcceptAction::Fatal, "errno {code}");
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_raw_supplements_are_exhaustion_only() {
+        for code in [24, 23, 55] {
+            assert_eq!(classify(&io::Error::from_raw_os_error(code)), AcceptAction::Backoff, "errno {code}");
+        }
+        // EBADF / ENOTSOCK / EOPNOTSUPP：BSD 不透传，按故障处理
+        for code in [9, 38, 102] {
+            assert_eq!(classify(&io::Error::from_raw_os_error(code)), AcceptAction::Fatal, "errno {code}");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_raw_supplements_cover_unmapped_wsa() {
+        for code in [10004, 10036, 10045, 10052] {
+            assert_eq!(classify(&io::Error::from_raw_os_error(code)), AcceptAction::Retry, "WSA {code}");
+        }
+        for code in [10024, 10055] {
+            assert_eq!(classify(&io::Error::from_raw_os_error(code)), AcceptAction::Backoff, "WSA {code}");
+        }
+        for code in [10009, 10038] {
+            assert_eq!(classify(&io::Error::from_raw_os_error(code)), AcceptAction::Fatal, "WSA {code}");
+        }
     }
 
     #[test]
@@ -227,16 +288,16 @@ mod tests {
     }
 
     #[test]
-    fn failure_streak_escalates_within_idle_gap() {
+    fn failure_streak_escalates_within_recovery_window() {
         let t0 = Instant::now();
         let mut streak = FailureStreak::default();
-        assert!(streak.record(t0) < ESCALATE_AFTER);
+        assert!(streak.record(t0).elapsed < ESCALATE_AFTER);
 
         let mut t = t0;
         let mut escalated_at = None;
         for second in 1..=40 {
             t += Duration::from_secs(1);
-            if streak.record(t) >= ESCALATE_AFTER {
+            if streak.record(t).elapsed >= ESCALATE_AFTER {
                 escalated_at = Some(second);
                 break;
             }
@@ -245,17 +306,32 @@ mod tests {
     }
 
     #[test]
-    fn failure_streak_restarts_after_idle_gap() {
+    fn failure_streak_restarts_after_recovery_window() {
         let t0 = Instant::now();
         let mut streak = FailureStreak::default();
         streak.record(t0);
 
-        // 空档超过阈值：视为新的一段，第一次孤立失败不升级
-        let t1 = t0 + FAILURE_IDLE_GAP + Duration::from_secs(1);
-        assert!(streak.record(t1) < ESCALATE_AFTER);
+        // 空档超过窗口：视为新的一段，第一次孤立失败不升级
+        let t1 = t0 + FAILURE_RECOVERY_WINDOW + Duration::from_secs(1);
+        assert!(streak.record(t1).elapsed < ESCALATE_AFTER);
         // 再隔 31s 的孤立失败仍不升级
         let t2 = t1 + Duration::from_secs(31);
-        assert!(streak.record(t2) < ESCALATE_AFTER);
+        assert!(streak.record(t2).elapsed < ESCALATE_AFTER);
+    }
+
+    #[test]
+    fn failure_count_resets_outside_recovery_window() {
+        let t0 = Instant::now();
+        let mut streak = FailureStreak::default();
+        assert_eq!(streak.record(t0).prior, 0);
+        assert_eq!(streak.record(t0 + Duration::from_secs(1)).prior, 1);
+        assert_eq!(streak.record(t0 + Duration::from_secs(2)).prior, 2);
+
+        // 空档超过窗口：计数与持续时长同时回到起点，退避档位不再继承
+        let after_gap =
+            streak.record(t0 + Duration::from_secs(2) + FAILURE_RECOVERY_WINDOW + Duration::from_millis(1));
+        assert_eq!(after_gap.prior, 0);
+        assert_eq!(after_gap.elapsed, Duration::ZERO);
     }
 
     #[test]
@@ -268,9 +344,11 @@ mod tests {
             t += Duration::from_secs(1);
             streak.record(t);
         }
-        assert!(streak.record(t + Duration::from_secs(1)) >= ESCALATE_AFTER);
+        assert!(streak.record(t + Duration::from_secs(1)).elapsed >= ESCALATE_AFTER);
 
         streak.clear();
-        assert!(streak.record(t + Duration::from_secs(2)) < ESCALATE_AFTER, "成功后应重新起算");
+        let after_success = streak.record(t + Duration::from_secs(2));
+        assert!(after_success.elapsed < ESCALATE_AFTER, "成功后应重新起算");
+        assert_eq!(after_success.prior, 0, "成功后退避档位应从起点开始");
     }
 }

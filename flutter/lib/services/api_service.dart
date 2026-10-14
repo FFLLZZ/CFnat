@@ -13,6 +13,7 @@ class ApiService extends AppService {
   int _streamGeneration = 0;
   Timer? _reconnectTimer;
   int _reconnectAttempts = 0;
+  String? _error;
 
   /// 一次性请求各自新建 client，与 package:http 顶层 get/post 的语义一致；
   /// SSE 的 client 单独持有，直到流结束
@@ -22,6 +23,8 @@ class ApiService extends AppService {
   StatusData? get status => _status;
   @override
   ConfigData? get config => _config;
+  @override
+  String? get lastError => _error;
   @override
   bool get connected => _connected;
   @override
@@ -213,6 +216,8 @@ class ApiService extends AppService {
     String? addr,
     int? maxStickySlots,
   }) async {
+    // 每次动作先清空上一次的原因，避免把旧错误当成本次结果展示
+    _error = null;
     try {
       final body = <String, dynamic>{
         'ip_file': ipFile,
@@ -241,11 +246,18 @@ class ApiService extends AppService {
         if (success) {
           await _restartStreaming();
           await fetchConfig();
+        } else {
+          // 业务错误：原因由后端给出，缺失时留给 UI 的兜底文案
+          final message = result['message'];
+          _error = message is String && message.isNotEmpty ? message : null;
         }
         return success;
       }
+      _error = 'HTTP ${response.statusCode}';
       return false;
     } catch (e) {
+      // 网络异常与上面的业务错误区分开：这里没有后端给出的原因
+      _error = e.toString();
       debugPrint('启动服务失败: $e');
       return false;
     }
@@ -253,6 +265,7 @@ class ApiService extends AppService {
 
   @override
   Future<bool> stopService() async {
+    _error = null;
     try {
       final response = await _post(Uri.parse('/api/stop'));
       if (response.statusCode == 200) {
@@ -262,11 +275,16 @@ class ApiService extends AppService {
           _status = StatusData.stopped();
           notifyIfAlive();
           await _restartStreaming();
+        } else {
+          final message = result['message'];
+          _error = message is String && message.isNotEmpty ? message : null;
         }
         return success;
       }
+      _error = 'HTTP ${response.statusCode}';
       return false;
     } catch (e) {
+      _error = e.toString();
       debugPrint('停止服务失败: $e');
       return false;
     }
