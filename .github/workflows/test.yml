@@ -1,0 +1,38 @@
+name: 测试与静态检查
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust:
+    name: Rust ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: 缓存构建产物
+        uses: Swatinem/rust-cache@v2
+
+      # rust-embed 要求 folder 指向的目录存在；web 资源由发布流程生成，
+      # 测试阶段只需目录在位
+      - name: 创建 rust-embed 资源目录
+        run: mkdir -p web flutter/build/web
+        shell: bash
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: 测试
+        run: cargo test --lib --all-features

@@ -153,6 +153,12 @@ impl ConnectionRegistry {
     }
 }
 
+impl Default for ConnectionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// 任务退出（含 panic）时自动把连接从登记表摘除
 struct RegistryGuard {
     registry: Arc<ConnectionRegistry>,
@@ -504,10 +510,10 @@ mod tests {
     /// 连接是否已被对端关闭（EOF 或错误）
     async fn read_closed(client: &mut TcpStream) -> bool {
         let mut buf = [0u8; 1];
-        match tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) => true,
-            _ => false,
-        }
+        matches!(
+            tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

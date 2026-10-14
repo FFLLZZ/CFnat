@@ -29,12 +29,11 @@ async fn run(service: Arc<ServiceState>) {
         let config = service.get_config();
         let addr = config.addr;
         let api_addr = config.api_addr
-            .map(|a| {
+            .inspect(|&a| {
                 if a == addr && a.port() != 0 {
                     eprintln!("错误: -api 和 -addr 参数不能使用相同地址: {}", a);
                     std::process::exit(1);
                 }
-                a
             })
             .unwrap_or_else(|| ApiConfig::default().api_addr);
 
