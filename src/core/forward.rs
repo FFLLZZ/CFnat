@@ -251,6 +251,20 @@ async fn race_connect(
     winner
 }
 
+/// 胜出后端的配额守卫：析构时归还连接计数，
+/// nodelay 等设置失败的提前返回路径同样成对释放
+struct BackendGuard {
+    lb: Arc<LoadBalancer>,
+    backend: Arc<Backend>,
+}
+
+impl Drop for BackendGuard {
+    fn drop(&mut self) {
+        self.lb.check_and_evict(&self.backend);
+        self.lb.release(&self.backend);
+    }
+}
+
 async fn handle_client(
     client: TcpStream,
     lb: Arc<LoadBalancer>,
@@ -316,6 +330,8 @@ async fn handle_client(
         }
     }
 
+    let backend_guard = BackendGuard { lb: lb.clone(), backend: backend.clone() };
+
     server.set_nodelay(true)?;
     client.set_nodelay(true)?;
     registry.attach_server(conn_id, &server);
@@ -340,8 +356,8 @@ async fn handle_client(
         (Err(e), _) | (_, Err(e)) => Err(e),
     };
 
-    lb.check_and_evict(&backend);
-    lb.release(&backend);
+    // 先归还配额再记快败统计
+    drop(backend_guard);
 
     let lifetime = connect_start.elapsed();
     if result.is_err() && lifetime < FAST_FAIL_THRESHOLD {
@@ -525,5 +541,22 @@ mod tests {
         drop(client);
         assert!(wait_until(|| registry.active_count() == 0, Duration::from_secs(12)).await);
         token.cancel();
+    }
+
+    /// 配额守卫析构时归还连接计数，设置失败的提前返回不会泄漏配额
+    #[test]
+    fn backend_guard_releases_quota_on_drop() {
+        let lb = Arc::new(LoadBalancer::new(1));
+        let addr: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        lb.add_to_primary(addr, 0.0, 0.0, None);
+
+        let backend = lb.select().expect("池非空应可选");
+        assert_eq!(backend.connections(), 1);
+
+        {
+            let _guard = BackendGuard { lb: lb.clone(), backend: backend.clone() };
+            assert_eq!(backend.connections(), 1, "守卫存续期间配额保持占用");
+        }
+        assert_eq!(backend.connections(), 0, "守卫析构后配额归还");
     }
 }
