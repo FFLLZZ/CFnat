@@ -78,6 +78,47 @@ impl From<cfnat::log::LogEntry> for LogItem {
     }
 }
 
+/// 错误性质，与 cfnat 核心的 ErrorCategory 一一对应；
+/// 少量稳定类别，具体原因由 ActionResult::message 承载
+#[frb]
+pub enum ErrorCategory {
+    Validation,
+    Lifecycle,
+    Runtime,
+}
+
+impl From<cfnat::core::ErrorCategory> for ErrorCategory {
+    fn from(category: cfnat::core::ErrorCategory) -> Self {
+        match category {
+            cfnat::core::ErrorCategory::Validation => Self::Validation,
+            cfnat::core::ErrorCategory::Lifecycle => Self::Lifecycle,
+            cfnat::core::ErrorCategory::Runtime => Self::Runtime,
+        }
+    }
+}
+
+/// 启动 / 停止的统一结果：成功时 message 与 category 均为 None
+#[frb]
+pub struct ActionResult {
+    pub success: bool,
+    pub message: Option<String>,
+    pub category: Option<ErrorCategory>,
+}
+
+impl ActionResult {
+    fn ok() -> Self {
+        Self { success: true, message: None, category: None }
+    }
+
+    fn from_error(error: cfnat::core::ServiceError) -> Self {
+        Self {
+            success: false,
+            message: Some(error.message),
+            category: Some(error.category.into()),
+        }
+    }
+}
+
 fn build_overrides(
     ip_file: Option<String>,
     ip_content: Option<Vec<String>>,
@@ -122,7 +163,7 @@ pub fn start_service(
     max_sticky_slots: Option<i32>,
     addr: Option<String>,
     colo: Option<Vec<String>>,
-) -> bool {
+) -> ActionResult {
     let runtime = get_runtime();
     let _guard = runtime.enter();
 
@@ -138,16 +179,22 @@ pub fn start_service(
 
     service.update_config(config);
 
-    service.start_with_ips(
+    match service.start_with_ips(
         overrides.ip_file.as_deref(),
         overrides.ip_content.as_deref(),
-    ).is_ok()
+    ) {
+        Ok(()) => ActionResult::ok(),
+        Err(e) => ActionResult::from_error(e),
+    }
 }
 
 #[frb]
-pub fn stop_service() -> bool {
+pub fn stop_service() -> ActionResult {
     let service = get_service();
-    get_runtime().block_on(service.stop()).is_ok()
+    match get_runtime().block_on(service.stop()) {
+        Ok(()) => ActionResult::ok(),
+        Err(e) => ActionResult::from_error(e),
+    }
 }
 
 #[frb]

@@ -12,6 +12,11 @@ class ApiService extends AppService {
   Client? _streamClient;
   int _streamGeneration = 0;
   Timer? _reconnectTimer;
+  int _reconnectAttempts = 0;
+
+  /// 一次性请求各自新建 client，与 package:http 顶层 get/post 的语义一致；
+  /// SSE 的 client 单独持有，直到流结束
+  final Client Function() _newClient;
 
   @override
   StatusData? get status => _status;
@@ -22,25 +27,36 @@ class ApiService extends AppService {
   @override
   bool get isRunning => _status?.running ?? false;
 
-  ApiService() {
+  ApiService({Client Function()? clientFactory}) : _newClient = clientFactory ?? Client.new {
     _startStreaming();
   }
 
   void _handleDisconnect() {
+    if (isDisposed) return;
     _connected = false;
     _status = null;
-    notifyListeners();
+    notifyIfAlive();
   }
 
   void _scheduleReconnect() {
+    if (isDisposed) return;
     _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(const Duration(seconds: 1), _startStreaming);
+    _reconnectTimer = Timer(_reconnectDelay(_reconnectAttempts), _startStreaming);
+    _reconnectAttempts++;
+  }
+
+  /// 指数退避，上限 15s，避免服务未就绪时以固定频率重连
+  static Duration _reconnectDelay(int attempts) {
+    const minMs = 500;
+    const maxMs = 15000;
+    return Duration(milliseconds: attempts >= 5 ? maxMs : minMs << attempts);
   }
 
   void _startStreaming() async {
+    if (isDisposed) return;
     final generation = ++_streamGeneration;
     try {
-      final client = Client();
+      final client = _newClient();
       _streamClient = client;
       final request = Request('GET', Uri.parse('/api/stream'));
       
@@ -78,7 +94,8 @@ class ApiService extends AppService {
                     _config = ConfigData.fromJson(data['config']);
                   }
                   _connected = true;
-                  notifyListeners();
+                  _reconnectAttempts = 0;
+                  notifyIfAlive();
                 } catch (e) {
                   debugPrint('解析SSE数据失败: $e');
                 }
@@ -110,6 +127,9 @@ class ApiService extends AppService {
 
   @override
   void dispose() {
+    markDisposed();
+    // 递增代数使在途的 send/回调失效，避免旧连接在释放后接管状态
+    _streamGeneration++;
     _reconnectTimer?.cancel();
     _streamSubscription?.cancel();
     _streamClient?.close();
@@ -117,6 +137,7 @@ class ApiService extends AppService {
   }
 
   Future<void> _restartStreaming() async {
+    if (isDisposed) return;
     _streamGeneration++;
     _reconnectTimer?.cancel();
     await _streamSubscription?.cancel();
@@ -126,10 +147,30 @@ class ApiService extends AppService {
     _startStreaming();
   }
 
+  Future<Response> _get(Uri uri) async {
+    final client = _newClient();
+    try {
+      return await client.get(uri);
+    } finally {
+      client.close();
+    }
+  }
+
+  Future<Response> _post(Uri uri, {Object? body, Map<String, String>? headers}) async {
+    final client = _newClient();
+    try {
+      return await client.post(uri, headers: headers, body: body);
+    } finally {
+      client.close();
+    }
+  }
+
   @override
   Future<void> fetchStatus() async {
+    if (isDisposed) return;
     try {
-      final response = await get(Uri.parse('/api/status'));
+      final response = await _get(Uri.parse('/api/status'));
+      if (isDisposed) return;
       if (response.statusCode == 200) {
         _status = StatusData.fromJson(json.decode(response.body));
         _connected = true;
@@ -138,13 +179,15 @@ class ApiService extends AppService {
       debugPrint('获取状态失败: $e');
       _handleDisconnect();
     }
-    notifyListeners();
+    notifyIfAlive();
   }
 
   @override
   Future<void> fetchConfig() async {
+    if (isDisposed) return;
     try {
-      final response = await get(Uri.parse('/api/config'));
+      final response = await _get(Uri.parse('/api/config'));
+      if (isDisposed) return;
       if (response.statusCode == 200) {
         _config = ConfigData.fromJson(json.decode(response.body));
         _connected = true;
@@ -152,7 +195,7 @@ class ApiService extends AppService {
     } catch (e) {
       debugPrint('获取配置失败: $e');
     }
-    notifyListeners();
+    notifyIfAlive();
   }
 
   @override
@@ -186,7 +229,7 @@ class ApiService extends AppService {
         'max_sticky_slots': maxStickySlots,
       }..removeWhere((key, value) => value == null);
 
-      final response = await post(
+      final response = await _post(
         Uri.parse('/api/start'),
         headers: {'Content-Type': 'application/json'},
         body: json.encode(body),
@@ -211,13 +254,13 @@ class ApiService extends AppService {
   @override
   Future<bool> stopService() async {
     try {
-      final response = await post(Uri.parse('/api/stop'));
+      final response = await _post(Uri.parse('/api/stop'));
       if (response.statusCode == 200) {
         final result = json.decode(response.body);
         final success = result['success'] == true;
         if (success) {
           _status = StatusData.stopped();
-          notifyListeners();
+          notifyIfAlive();
           await _restartStreaming();
         }
         return success;
@@ -232,7 +275,7 @@ class ApiService extends AppService {
   @override
   Future<List<LogEntry>> fetchLogs() async {
     try {
-      final response = await get(Uri.parse('/api/logs'));
+      final response = await _get(Uri.parse('/api/logs'));
       if (response.statusCode == 200) {
         final List<dynamic> data = json.decode(response.body);
         return data.map((e) => LogEntry.fromJson(e)).toList();
@@ -247,7 +290,7 @@ class ApiService extends AppService {
   @override
   Future<bool> clearLogs() async {
     try {
-      final response = await post(Uri.parse('/api/logs/clear'));
+      final response = await _post(Uri.parse('/api/logs/clear'));
       if (response.statusCode == 200) {
         final result = json.decode(response.body);
         return result['success'] == true;

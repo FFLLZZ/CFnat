@@ -658,7 +658,10 @@ impl LoadBalancer {
 
         let cancel_token = self.cancel_token.clone();
 
-        let Some((_, host, scheme, path)) = crate::core::hyper::parse_url(&self.health_check_url) else { return handles };
+        let Some((_, host, scheme, path)) = crate::core::hyper::parse_url(&self.health_check_url) else {
+            push_log("WARN", &format!("健康检查 URL 无法解析，本次未启动健康检查: {}", self.health_check_url));
+            return handles;
+        };
 
         let ping_config = PingConfig {
             tls_port: self.tls_port,

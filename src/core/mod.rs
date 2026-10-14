@@ -1,3 +1,4 @@
+pub mod accept_error;
 pub mod backend;
 pub mod cancel;
 pub mod config;
@@ -21,5 +22,5 @@ pub(crate) use hyper::build_hyper_client;
 pub use ip::IpPool;
 pub use loadbalancer::LoadBalancer;
 pub use pool::init_global_limiter;
-pub use service::{ServiceConfig, ServiceState};
+pub use service::{ErrorCategory, ServiceConfig, ServiceError, ServiceState};
 pub use types::{ConfigOverrides, IpInfo, StatusInfo};

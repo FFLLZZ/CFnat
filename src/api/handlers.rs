@@ -38,7 +38,7 @@ pub async fn start_service(
         }),
         Err(e) => Json(ApiResponse {
             success: false,
-            message: e,
+            message: e.message,
         }),
     }
 }
@@ -51,7 +51,7 @@ pub async fn stop_service(State(state): State<AppState>) -> Json<ApiResponse> {
         }),
         Err(e) => Json(ApiResponse {
             success: false,
-            message: e,
+            message: e.message,
         }),
     }
 }

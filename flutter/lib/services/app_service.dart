@@ -1,10 +1,33 @@
 import 'package:flutter/material.dart';
 
 abstract class AppService extends ChangeNotifier {
+  bool _disposed = false;
+
+  /// 释放标记：子类在所有异步边界用它判断对象是否已失效
+  @protected
+  bool get isDisposed => _disposed;
+
+  /// 在 dispose() 最前面调用；置位后任何通知都会被静默丢弃
+  @protected
+  void markDisposed() {
+    _disposed = true;
+  }
+
+  /// 唯一的通知出口：ChangeNotifier 释放后调用 notifyListeners 会断言失败
+  @protected
+  void notifyIfAlive() {
+    if (_disposed) return;
+    notifyListeners();
+  }
+
   StatusData? get status;
   ConfigData? get config;
   bool get connected;
   bool get isRunning;
+
+  /// 最近一次操作失败的可展示原因；无失败或后端未提供原因时为 null。
+  /// UI 只展示该文本，不据其推断错误类型（类型由后端结构化返回）
+  String? get lastError => null;
 
   Future<void> fetchStatus();
   Future<void> fetchConfig();
@@ -211,6 +234,6 @@ class ConfigData {
         http,
         ipFile,
         maxStickySlots,
-        colo,
+        Object.hashAll(colo ?? const <String>[]),
       );
 }

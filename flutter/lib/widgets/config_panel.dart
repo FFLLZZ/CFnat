@@ -390,25 +390,25 @@ class _ConfigPanelState extends State<ConfigPanel> {
         dialogTitle: '选择测速文件',
       );
       
-      if (file != null) {
-        final path = file.path;
-        
-        if (path != null) {
-          setState(() {
-            _ipContent = null;
-          });
-          controller.text = path;
-        } else {
-          final bytes = await file.readAsBytes();
-          final content = utf8.decode(bytes, allowMalformed: true);
-          setState(() {
-            _ipContent = content.split('\n')
-                .map((line) => line.trim())
-                .where((line) => line.isNotEmpty)
-                .toList();
-          });
-          controller.text = file.name;
-        }
+      if (!mounted || file == null) return;
+
+      final path = file.path;
+      if (path != null) {
+        setState(() {
+          _ipContent = null;
+        });
+        controller.text = path;
+      } else {
+        final bytes = await file.readAsBytes();
+        if (!mounted) return;
+        final content = utf8.decode(bytes, allowMalformed: true);
+        setState(() {
+          _ipContent = content.split('\n')
+              .map((line) => line.trim())
+              .where((line) => line.isNotEmpty)
+              .toList();
+        });
+        controller.text = file.name;
       }
     } catch (e) {
       debugPrint('文件选择失败: $e');
@@ -659,8 +659,15 @@ class _ConfigPanelState extends State<ConfigPanel> {
     setState(() {
       _actionInProgress = false;
     });
+    final error = widget.service.lastError;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(success ? '$label成功' : '$label失败')),
+      SnackBar(
+        content: Text(
+          success
+              ? '$label成功'
+              : (error == null || error.isEmpty ? '$label失败' : '$label失败：$error'),
+        ),
+      ),
     );
   }
 }

@@ -6,18 +6,21 @@ use tokio::task::JoinHandle;
 
 use crate::core::{IpPool, LoadBalancer, HttpingConfig, build_hyper_client, run_continuous_httping, run_forward, CancellationToken, ConnectionRegistry};
 use crate::core::types::{StatusInfo, ConfigOverrides};
+use crate::core::accept_error;
 use crate::log::{push_log, reset_start_time, get_log_buffer};
 
 /// 单次测速 / 健康检查请求超时（毫秒）
 const REQUEST_TIMEOUT_MS: u64 = 1800;
 
-/// stop 阶段单个后台任务的等待上限
-const HANDLE_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+/// stop 阶段第一轮等待的总预算，所有句柄共享同一份，不按句柄重复计算
+const HANDLE_STOP_BUDGET: Duration = Duration::from_secs(3);
 
 /// 服务相位：实例所有权随相位移动，任意时刻至多一个有效实例
 enum Phase {
     Stopped,
     Starting,
+    /// 实例所有权在相位内。Running 只是生命周期相位，不保证转发任务仍然存活；
+    /// 转发是否存活以 ServiceInstance::forward_fault 为准
     Running(Arc<ServiceInstance>),
     /// 实例由 stop 的局部变量持有，此相位仅表示停止进行中
     Stopping,
@@ -30,6 +33,59 @@ struct ServiceInstance {
     registry: Arc<ConnectionRegistry>,
     start_time: Instant,
     handles: Mutex<Vec<JoinHandle<()>>>,
+    /// 转发任务首次异常退出的原因；None 表示转发任务仍存活
+    forward_fault: Arc<Mutex<Option<String>>>,
+}
+
+impl ServiceInstance {
+    /// 转发任务首次异常退出的原因，None 表示仍存活。
+    /// 读取时不持锁做日志、网络或其他阻塞操作
+    fn forward_fault(&self) -> Option<String> {
+        self.forward_fault.lock().clone()
+    }
+}
+
+/// 只保留首次故障原因，后续错误不覆盖原始原因
+fn record_forward_fault(slot: &Mutex<Option<String>>, reason: String) {
+    let mut fault = slot.lock();
+    if fault.is_none() {
+        *fault = Some(reason);
+    }
+}
+
+/// 错误性质：用少量稳定类别描述，具体原因由 message 承载，
+/// 避免每新增一条文案就改动跨层接口
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCategory {
+    /// 配置的语法或结构非法
+    Validation,
+    /// 与服务生命周期相位冲突
+    Lifecycle,
+    /// 启动或运行期失败
+    Runtime,
+}
+
+/// 服务状态机错误：稳定的 category + 供展示的具体原因
+#[derive(Debug, Clone)]
+pub struct ServiceError {
+    pub category: ErrorCategory,
+    pub message: String,
+}
+
+impl ServiceError {
+    fn validation(message: impl Into<String>) -> Self {
+        Self { category: ErrorCategory::Validation, message: message.into() }
+    }
+
+    fn lifecycle(message: impl Into<String>) -> Self {
+        Self { category: ErrorCategory::Lifecycle, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 pub struct ServiceState {
@@ -47,12 +103,20 @@ impl Drop for StartGuard<'_> {
     }
 }
 
-/// 逐句柄等待退出；超时的句柄显式 abort 并等其落地，不静默丢弃。
-/// 返回被强制终止的任务数。
-async fn await_handles(handles: &mut [JoinHandle<()>], limit: Duration) -> usize {
+/// 等待全部句柄退出。第一轮共享一个总预算：预算耗尽后不再对后续句柄正常等待，
+/// 统一 abort 再等其实际落地，不静默丢弃。返回被强制终止的任务数。
+/// 预算只约束第一轮；收尾等待没有时间上限，以保证进入 Stopped 前资源确已释放。
+async fn await_handles(handles: &mut [JoinHandle<()>], budget: Duration) -> usize {
+    // deadline 取自 tokio 时钟：生产构建下与 std::time::Instant 同源，
+    // 测试下随虚拟时间推进，使共享预算可被确定性验证
+    let deadline = tokio::time::Instant::now() + budget;
     let mut stuck = Vec::new();
+    let mut stuck_ids = Vec::new();
     for handle in handles.iter_mut() {
-        if tokio::time::timeout(limit, &mut *handle).await.is_err() {
+        let id = handle.id();
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if tokio::time::timeout(remaining, &mut *handle).await.is_err() {
+            stuck_ids.push(id);
             stuck.push(handle);
         }
     }
@@ -60,9 +124,18 @@ async fn await_handles(handles: &mut [JoinHandle<()>], limit: Duration) -> usize
     for handle in &stuck {
         handle.abort();
     }
+    let tail_start = tokio::time::Instant::now();
     for handle in stuck {
         // abort 后任务在下一个 await 点落地，等待其完全退出再宣告停止
         let _ = handle.await;
+    }
+    // 收尾等待无上限，超预算只记录不缩短
+    let tail = tail_start.elapsed();
+    if count > 0 && tail > budget {
+        push_log("ERROR", &format!(
+            "{} 个任务被强制终止后，收尾等待 {:?} 超出预算 {:?}（任务 id: {:?}）",
+            count, tail, budget, stuck_ids
+        ));
     }
     count
 }
@@ -92,15 +165,26 @@ impl ServiceConfig {
         if let Some(v) = &overrides.http { self.http = v.clone(); }
         if let Some(v) = overrides.delay_limit { self.delay_limit = v.clamp(1, 2000); }
         if let Some(v) = overrides.tlr { self.tlr = v.clamp(0.0, 1.0); }
-        if let Some(v) = overrides.ips { self.ips = v.max(1).min(128); }
-        if let Some(v) = overrides.threads { self.threads = v.max(1).min(1024); }
+        if let Some(v) = overrides.ips { self.ips = v.clamp(1, 128); }
+        if let Some(v) = overrides.threads { self.threads = v.clamp(1, 1024); }
         if let Some(v) = overrides.tls_port { self.tls_port = v.max(1); }
         if let Some(v) = overrides.http_port { self.http_port = v.max(1); }
         if let Some(v) = &overrides.colo { self.colo = Some(v.clone()); }
         if let Some(v) = overrides.addr { self.addr = v; }
-        if let Some(v) = overrides.max_sticky_slots { self.max_sticky_slots = v.max(1).min(32); }
+        if let Some(v) = overrides.max_sticky_slots { self.max_sticky_slots = v.clamp(1, 32); }
         #[cfg(feature = "web")]
         if let Some(v) = overrides.api_addr { self.api_addr = Some(v); }
+    }
+
+    /// 校验启动所需配置的语法与结构，不做网络可达性检查。
+    /// 复用测速 / 健康检查的同一套 URL 解析，不引入第二套规则
+    pub fn validate(&self) -> Result<(), ServiceError> {
+        if crate::core::hyper::parse_url(&self.http).is_none() {
+            return Err(ServiceError::validation(
+                format!("测速地址无效（需包含 scheme 与 host）: {}", self.http),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -138,6 +222,8 @@ impl ServiceState {
         }
     }
 
+    /// 仅表示生命周期相位为 Running，不保证转发任务仍存活；
+    /// 对外是否按正常运行对待见 build_full_status
     pub fn is_running(&self) -> bool {
         matches!(&*self.phase.lock(), Phase::Running(_))
     }
@@ -157,9 +243,19 @@ impl ServiceState {
         }
     }
 
+    /// 对外状态契约：
+    /// - `running=true` 当且仅当相位为 Running 且转发任务仍存活；
+    /// - `running=false` 只表示不能按正常运行对待，不代表清理已完成：
+    ///   此时相位可能仍是 Running（实例待 stop 清理），也可能已是 Stopped；
+    /// - 转发故障时返回 StatusInfo::empty()，不上报 uptime 与 IP 指标，
+    ///   避免把"端口已关、任务已死"呈现成正常运行。
     pub fn build_full_status(&self) -> StatusInfo {
         match &*self.phase.lock() {
             Phase::Running(inst) => {
+                // 先读故障槽再决定返回哪种状态，判断集中在这一处
+                if inst.forward_fault().is_some() {
+                    return StatusInfo::empty();
+                }
                 let mut info = StatusInfo::from_loadbalancer(&inst.lb);
                 info.running = true;
                 info.uptime_secs = inst.start_time.elapsed().as_secs();
@@ -171,33 +267,37 @@ impl ServiceState {
 
     /// 占住 Starting 相位，构建期间任何并发 start/stop 都得到明确错误。
     /// 返回的守卫在 panic 或提前返回时把相位回滚为 Stopped。
-    fn begin_start(&self) -> Result<StartGuard<'_>, String> {
+    fn begin_start(&self) -> Result<StartGuard<'_>, ServiceError> {
         let mut phase = self.phase.lock();
         match *phase {
             Phase::Stopped => {
                 *phase = Phase::Starting;
                 Ok(StartGuard(&self.phase))
             }
-            Phase::Starting => Err("服务正在启动".to_string()),
-            Phase::Running(_) => Err("服务已在运行".to_string()),
-            Phase::Stopping => Err("服务正在停止".to_string()),
+            Phase::Starting => Err(ServiceError::lifecycle("服务正在启动")),
+            Phase::Running(_) => Err(ServiceError::lifecycle("服务已在运行")),
+            Phase::Stopping => Err(ServiceError::lifecycle("服务正在停止")),
         }
     }
 
-    pub fn start(&self) -> Result<(), String> {
+    pub fn start(&self) -> Result<(), ServiceError> {
         let guard = self.begin_start()?;
 
         let config = self.get_config();
+        config.validate()?;
         let ip_pool = Arc::new(IpPool::from_file(&config.ip_file));
         if ip_pool.total_count() == 0 {
-            return Err("未找到有效的 IP".to_string());
+            return Err(ServiceError::validation("未找到有效的 IP"));
         }
 
-        self.finish_start(ip_pool, guard)
+        self.finish_start(config, ip_pool, guard)
     }
 
-    pub fn start_with_ips(&self, ip_file: Option<&str>, ip_content: Option<&[String]>) -> Result<(), String> {
+    pub fn start_with_ips(&self, ip_file: Option<&str>, ip_content: Option<&[String]>) -> Result<(), ServiceError> {
         let guard = self.begin_start()?;
+
+        let config = self.get_config();
+        config.validate()?;
 
         let mut all_ips = Vec::new();
 
@@ -223,30 +323,28 @@ impl ServiceState {
         }
 
         if all_ips.is_empty() {
-            let config = self.get_config();
             // 显式传入的文件未能提供任何 IP 时回退到配置文件，必须让调用方从日志识别实际来源
             if let Some(file) = ip_file.filter(|f| !f.is_empty()) {
                 push_log("WARN", &format!("IP 文件 {} 未提供有效 IP，回退使用 {}", file, config.ip_file));
             }
             let ip_pool = Arc::new(IpPool::from_file(&config.ip_file));
             if ip_pool.total_count() == 0 {
-                return Err("未找到有效的 IP".to_string());
+                return Err(ServiceError::validation("未找到有效的 IP"));
             }
-            return self.finish_start(ip_pool, guard);
+            return self.finish_start(config, ip_pool, guard);
         }
 
         let ip_pool = Arc::new(IpPool::new(&all_ips));
-        self.finish_start(ip_pool, guard)
+        self.finish_start(config, ip_pool, guard)
     }
 
     /// 构建 instance 并登记为 Running。构建全部在临界区外完成；
     /// 守卫在此被消费，之后相位由 Phase::Running 承接。
-    fn finish_start(&self, ip_pool: Arc<IpPool>, guard: StartGuard<'_>) -> Result<(), String> {
+    /// 配置取自入口处已校验的那一份，不在此重新读取，避免校验过的值与实际使用的值不一致
+    fn finish_start(&self, config: ServiceConfig, ip_pool: Arc<IpPool>, guard: StartGuard<'_>) -> Result<(), ServiceError> {
         // 启动前清空旧日志并重置时间基准
         reset_start_time();
         get_log_buffer().clear();
-
-        let config = self.get_config();
 
         let client = Arc::new(build_hyper_client(config.delay_limit));
         let (notify_tx, notify_rx) = tokio::sync::watch::channel(false);
@@ -304,10 +402,15 @@ impl ServiceState {
         let lb_forward = lb.clone();
         let forward_cancel_token = cancel_token.clone();
         let registry_forward = registry.clone();
+        let forward_fault = Arc::new(Mutex::new(None));
+        let forward_fault_task = forward_fault.clone();
 
         let forward_handle: JoinHandle<()> = tokio::spawn(async move {
             if let Err(e) = run_forward(addr, lb_forward, tls_port, http_port, forward_cancel_token, registry_forward).await {
-                push_log("ERROR", &format!("转发服务错误：{}", e));
+                let reason = accept_error::describe(&e);
+                // 先落故障信息再记日志：状态读取只依赖槽位，不依赖日志
+                record_forward_fault(&forward_fault_task, reason.clone());
+                push_log("ERROR", &format!("转发服务错误：{}", reason));
             }
         });
         handles.push(forward_handle);
@@ -319,19 +422,20 @@ impl ServiceState {
             registry,
             start_time: Instant::now(),
             handles: Mutex::new(handles),
+            forward_fault,
         }));
 
         Ok(())
     }
 
-    pub async fn stop(&self) -> Result<(), String> {
+    pub async fn stop(&self) -> Result<(), ServiceError> {
         let instance = {
             let mut phase = self.phase.lock();
             match &*phase {
                 Phase::Running(_) => {}
-                Phase::Stopping => return Err("服务正在停止".to_string()),
-                Phase::Starting => return Err("服务正在启动".to_string()),
-                Phase::Stopped => return Err("服务未运行".to_string()),
+                Phase::Stopping => return Err(ServiceError::lifecycle("服务正在停止")),
+                Phase::Starting => return Err(ServiceError::lifecycle("服务正在启动")),
+                Phase::Stopped => return Err(ServiceError::lifecycle("服务未运行")),
             }
             let inst = match std::mem::replace(&mut *phase, Phase::Stopped) {
                 Phase::Running(inst) => inst,
@@ -352,7 +456,7 @@ impl ServiceState {
                 let mut lock = instance.handles.lock();
                 std::mem::take(&mut *lock)
             };
-            await_handles(&mut handles, HANDLE_STOP_TIMEOUT).await
+            await_handles(&mut handles, HANDLE_STOP_BUDGET).await
         };
         if stuck > 0 {
             push_log("WARN", &format!("停止超时，{} 个任务未自行退出，已强制终止", stuck));
@@ -410,6 +514,63 @@ mod tests {
         assert_eq!(config.max_sticky_slots, 32);
     }
 
+    /// 启动前校验只认 URL 语法与结构：缺 scheme 或整体不可解析都拒绝
+    #[test]
+    fn validate_accepts_well_formed_url_and_rejects_malformed() {
+        let mut config = ServiceConfig::default();
+        assert!(config.validate().is_ok(), "默认测速地址应通过");
+
+        config.http = "https://example.com/cdn-cgi/trace".to_string();
+        assert!(config.validate().is_ok(), "https 地址应通过");
+
+        config.http = "cp.cloudflare.com/cdn-cgi/trace".to_string();
+        assert!(config.validate().is_err(), "缺少 scheme 应被拒绝");
+
+        config.http = String::new();
+        assert!(config.validate().is_err(), "空地址应被拒绝");
+    }
+
+    /// 校验失败必须由 StartGuard 回滚为 Stopped，且不阻断后续正常启动；
+    /// 同时固定 begin_start 的相位错误优先于配置错误的语义
+    #[test]
+    fn invalid_config_rolls_back_and_phase_error_takes_precedence() {
+        let rt = test_runtime();
+        let (service, path) = service_with_ip_file("invalid_http");
+        let _guard = rt.handle().enter();
+
+        // Stopped 态放入非法 URL（缺 scheme）
+        {
+            let mut config = service.get_config();
+            config.http = "cp.cloudflare.com/cdn-cgi/trace".to_string();
+            service.update_config(config);
+        }
+        let err = service.start().unwrap_err();
+        assert!(err.message.contains("测速地址无效"), "应返回配置错误，实际: {}", err.message);
+        assert_eq!(err.category, ErrorCategory::Validation);
+        assert!(!service.is_running(), "校验失败后相位必须回滚为 Stopped");
+
+        // 修复配置后可正常启动，证明回滚未留下残留
+        {
+            let mut config = service.get_config();
+            config.http = "http://127.0.0.1:9/cdn-cgi/trace".to_string();
+            service.update_config(config);
+        }
+        service.start().unwrap();
+        assert!(service.is_running());
+
+        // 运行中即使配置非法，也应先报相位错误而非配置错误
+        {
+            let mut config = service.get_config();
+            config.http = String::new();
+            service.update_config(config);
+        }
+        assert_eq!(service.start().unwrap_err().message, "服务已在运行");
+        assert_eq!(service.start().unwrap_err().category, ErrorCategory::Lifecycle);
+
+        rt.block_on(service.stop()).unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
     fn test_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap()
     }
@@ -458,7 +619,7 @@ mod tests {
         let (service, path) = service_with_ip_file("restart");
 
         // Stopped 时 stop 得到明确错误
-        assert_eq!(rt.block_on(service.stop()).unwrap_err(), "服务未运行");
+        assert_eq!(rt.block_on(service.stop()).unwrap_err().message, "服务未运行");
 
         let _guard = rt.handle().enter();
         service.start().unwrap();
@@ -480,7 +641,7 @@ mod tests {
 
         let _guard = rt.handle().enter();
         service.start().unwrap();
-        assert_eq!(service.start().unwrap_err(), "服务已在运行");
+        assert_eq!(service.start().unwrap_err().message, "服务已在运行");
         assert!(service.is_running());
         rt.block_on(service.stop()).unwrap();
         std::fs::remove_file(&path).ok();
@@ -492,9 +653,9 @@ mod tests {
         let (service, path) = service_with_ip_file("starting_phase");
 
         let guard = service.begin_start().unwrap();
-        assert_eq!(service.start().unwrap_err(), "服务正在启动");
+        assert_eq!(service.start().unwrap_err().message, "服务正在启动");
         let _guard = rt.handle().enter();
-        assert_eq!(rt.block_on(service.stop()).unwrap_err(), "服务正在启动");
+        assert_eq!(rt.block_on(service.stop()).unwrap_err().message, "服务正在启动");
 
         // 守卫 drop（模拟启动 panic / 提前返回）后相位回滚，可正常再次启动
         drop(guard);
@@ -517,5 +678,134 @@ mod tests {
 
         let aborted = rt.block_on(await_handles(&mut handles, Duration::from_millis(50)));
         assert_eq!(aborted, 1, "只有超时的任务被强制终止");
+    }
+
+    /// 共享预算：多个卡在同一等待阶段的句柄不再各自获得一份完整预算。
+    /// 用暂停时钟 + 自动推进按虚拟时间断言，不依赖真实墙钟
+    #[test]
+    fn await_handles_shares_one_deadline_across_handles() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let mut handles: Vec<_> = (0..3)
+                .map(|_| tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await }))
+                .collect();
+
+            let started = tokio::time::Instant::now();
+            let aborted = await_handles(&mut handles, HANDLE_STOP_BUDGET).await;
+            let elapsed = started.elapsed();
+
+            assert_eq!(aborted, 3, "三个卡住的任务都应被强制终止");
+            // 每句柄各自计预算会推进 3 份预算，共享预算只推进 1 份
+            assert!(
+                elapsed >= HANDLE_STOP_BUDGET && elapsed < HANDLE_STOP_BUDGET * 2,
+                "共享预算应在 1 份预算内完成，实际推进 {:?}",
+                elapsed
+            );
+        });
+    }
+
+    #[test]
+    fn forward_fault_keeps_first_reason() {
+        let slot = Mutex::new(None);
+        record_forward_fault(&slot, "首次原因".to_string());
+        record_forward_fault(&slot, "后续原因".to_string());
+        assert_eq!(slot.lock().as_deref(), Some("首次原因"));
+    }
+
+    /// 转发任务异常退出后：状态不再报告运行，但相位未变、实例仍待清理，
+    /// stop 仍按既有顺序收尾，之后可重新启动并重新绑定端口
+    #[test]
+    fn forward_failure_reports_not_running_and_stop_recovers() {
+        let rt = test_runtime();
+        let (service, path) = service_with_ip_file("forward_fault");
+
+        // 占住目标端口，使 run_forward 的 bind 立即失败（std 在 Windows 上不设 SO_REUSEADDR，
+        // 在 Linux 上 SO_REUSEADDR 也不能与处于 LISTEN 的 socket 共存）
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        {
+            let mut config = service.get_config();
+            config.addr = occupied.local_addr().unwrap();
+            service.update_config(config);
+        }
+
+        let _guard = rt.handle().enter();
+        service.start().unwrap();
+
+        // 等转发任务落地并写入故障槽
+        rt.block_on(async {
+            for _ in 0..200 {
+                if !service.build_full_status().running {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("转发任务未在 2 秒内进入故障状态");
+        });
+
+        let info = service.build_full_status();
+        assert!(!info.running, "转发任务已退出，不应再报告运行中");
+        assert_eq!(info.uptime_secs, 0, "故障状态不暴露 uptime");
+        assert!(info.primary_ips.is_empty(), "故障状态不暴露主队列 IP");
+        assert!(info.backup_ips.is_empty(), "故障状态不暴露备选 IP");
+        assert!(info.sticky_ips.is_empty(), "故障状态不暴露 sticky IP");
+
+        // 故障不直接改写相位：清理尚未发生，stop 仍能收尾
+        assert!(service.is_running(), "故障不应直接改写相位");
+        rt.block_on(service.stop()).unwrap();
+        assert!(!service.is_running());
+        assert!(!service.build_full_status().running);
+
+        // stop 完成后端口已释放，可重新启动并重新绑定
+        drop(occupied);
+        service.start().unwrap();
+        assert!(service.build_full_status().running, "重启后应恢复为正常运行");
+        rt.block_on(service.stop()).unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 启动使用的是入口处校验过的配置快照，而非 finish_start 内再次读取的配置
+    #[test]
+    fn finish_start_uses_validated_snapshot() {
+        let rt = test_runtime();
+        let (service, path) = service_with_ip_file("snapshot");
+
+        // 占住一个端口：快照用它作绑定地址 ⇒ 必然 bind 失败
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let snapshot = {
+            let mut config = service.get_config();
+            config.addr = occupied.local_addr().unwrap();
+            config
+        };
+        {
+            // 与快照不同的"当前配置"：地址可用，若被使用则转发不会落到故障态
+            let mut live = service.get_config();
+            live.addr = "127.0.0.1:0".parse().unwrap();
+            service.update_config(live);
+        }
+
+        let _guard = rt.handle().enter();
+        let guard = service.begin_start().unwrap();
+        let ip_pool = Arc::new(IpPool::from_file(&snapshot.ip_file));
+        service.finish_start(snapshot, ip_pool, guard).unwrap();
+
+        // 落入故障 ⇒ 使用的是快照里那个被占用的地址
+        rt.block_on(async {
+            for _ in 0..200 {
+                if !service.build_full_status().running {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("启动未使用已校验的快照：当前配置本可正常绑定");
+        });
+
+        rt.block_on(service.stop()).unwrap();
+        drop(occupied);
+        std::fs::remove_file(&path).ok();
     }
 }

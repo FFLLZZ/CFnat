@@ -10,6 +10,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+use crate::core::accept_error::{self, AcceptAction};
 use crate::core::backend::Backend;
 use crate::core::cancel::CancellationToken;
 use crate::core::loadbalancer::LoadBalancer;
@@ -371,11 +372,17 @@ pub async fn run_forward(
     let warned = Arc::new(AtomicBool::new(false));
     push_log("INFO", &format!("转发服务 {} (TLS:{}, HTTP:{})", local_addr, tls_port, http_port));
 
+    // 连续 accept 失败的两个独立度量：退避档位用失败次数，故障升级用失败持续时长
+    let mut consecutive_failures: u32 = 0;
+    let mut failure_streak = accept_error::FailureStreak::default();
+
     loop {
         tokio::select! {
             res = listener.accept() => {
                 match res {
                     Ok((client, _)) => {
+                        consecutive_failures = 0;
+                        failure_streak.clear();
                         // 克隆失败（fd 耗尽）的连接无法纳入 stop 回收，直接断开
                         let Some(conn_id) = registry.register(&client) else {
                             drop(client);
@@ -394,10 +401,34 @@ pub async fn run_forward(
                         });
                         registry.set_handle(conn_id, handle);
                     }
-                    Err(e) if e.raw_os_error() == Some(24) => {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    Err(e) => {
+                        match accept_error::classify(&e) {
+                            AcceptAction::Fatal => {
+                                return Err(io::Error::new(e.kind(), accept_error::describe(&e)));
+                            }
+                            action => {
+                                // 持续失败达到阈值即升级为故障，与退避档位各自独立
+                                let elapsed = failure_streak.record(Instant::now());
+                                if elapsed >= accept_error::ESCALATE_AFTER {
+                                    return Err(io::Error::new(
+                                        e.kind(),
+                                        format!(
+                                            "accept 连续失败超过 {:?}：{}",
+                                            accept_error::ESCALATE_AFTER,
+                                            accept_error::describe(&e)
+                                        ),
+                                    ));
+                                }
+                                let delay = accept_error::backoff_delay(action, consecutive_failures);
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                // 退避期间仍响应停止信号
+                                if tokio::time::timeout(delay, cancel_token.cancelled()).await.is_ok() {
+                                    push_log("INFO", "[转发服务] 收到停止信号，退出");
+                                    break;
+                                }
+                            }
+                        }
                     }
-                    Err(e) => return Err(e),
                 }
             }
             _ = cancel_token.cancelled() => {

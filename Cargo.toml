@@ -33,3 +33,7 @@ mimalloc = { version = "0.1", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# 测试需要暂停时钟并推进虚拟时间，避免用真实墙钟验证等待预算
+tokio = { version = "1", features = ["test-util"] }

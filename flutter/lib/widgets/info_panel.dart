@@ -159,6 +159,7 @@ class _InfoPanelState extends State<InfoPanel> {
     final titleSize = constraints.maxWidth > 400 ? 14.0 : 13.0;
     final ipSize = constraints.maxWidth > 400 ? 13.0 : 12.0;
     final headerSize = constraints.maxWidth > 400 ? 11.0 : 10.0;
+    final stickySet = stickyIps.toSet();
     
     return Card(
       elevation: 0,
@@ -217,7 +218,7 @@ class _InfoPanelState extends State<InfoPanel> {
               : ListView.builder(
                   itemCount: ips.length,
                   itemBuilder: (context, index) {
-                    return _buildIpRow(ips[index], stickyIps, padding, ipSize);
+                    return _buildIpRow(ips[index], stickySet, padding, ipSize);
                   },
                 ),
         ),
@@ -226,7 +227,7 @@ class _InfoPanelState extends State<InfoPanel> {
     );
   }
 
-  Widget _buildIpRow(IpInfo ip, List<String> stickyIps, double padding, double fontSize) {
+  Widget _buildIpRow(IpInfo ip, Set<String> stickyIps, double padding, double fontSize) {
     final delayColor = _getDelayColor(ip.delay);
     final lossColor = _getLossColor(ip.loss);
     final isSticky = stickyIps.contains(ip.ip);

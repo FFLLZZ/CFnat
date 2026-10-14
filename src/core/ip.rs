@@ -64,8 +64,9 @@ impl IpCidr {
     }
 }
 
-/// 128 位确定性伪随机数生成器，基于 splitmix64 扩展。
-/// 输入 obj_addr 确保同一来源生成的随机序列确定可复现。
+/// 128 位伪随机数生成器，基于 splitmix64 扩展。
+/// 种子混合函数地址、进程内自增计数器与局部变量地址，
+/// 因此同一 obj_addr 在不同调用、不同进程中得到的结果不同。
 fn generate_refined_random(obj_addr: usize) -> u128 {
     static SHARED_STATE: AtomicUsize = AtomicUsize::new(0);
 
