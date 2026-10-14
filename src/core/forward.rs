@@ -200,7 +200,7 @@ async fn transfer_direction(
             crate::core::splice::transfer(rfd, wfd)
         })
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))??
+        .map_err(|e| io::Error::other(e.to_string()))??
     }
 
     #[cfg(not(target_os = "linux"))]
