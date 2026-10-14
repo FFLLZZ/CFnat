@@ -584,6 +584,12 @@ impl LoadBalancer {
         self.inner.read().primary.len()
     }
 
+    /// 测速 / 健康检查请求超时（毫秒）。HTTP 客户端的连接预算初次构建与
+    /// rebuild_client 都取这一值
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+
     pub fn get_primary_target(&self) -> usize {
         self.primary_target.load(Ordering::Relaxed)
     }

@@ -371,24 +371,22 @@ impl ServiceState {
         reset_start_time();
         get_log_buffer().clear();
 
-        let client = Arc::new(build_hyper_client(config.delay_limit));
         let (notify_tx, notify_rx) = tokio::sync::watch::channel(false);
         let colo_filter = config.colo.clone();
 
         let cancel_token = CancellationToken::new();
 
-        let lb = Arc::new(
-            LoadBalancer::new(config.ips)
-                .with_delay_threshold(config.delay_limit as f32)
-                .with_loss_threshold(config.tlr as f32)
-                .with_health_check_url(config.http.clone())
-                .with_ports(config.tls_port, config.http_port)
-                .with_timeout(REQUEST_TIMEOUT_MS)
-                .with_notify(notify_tx)
-                .with_client(client.clone())
-                .with_colo_filter(colo_filter.clone())
-                .with_max_sticky_slots(config.max_sticky_slots),
-        );
+        let lb_builder = LoadBalancer::new(config.ips)
+            .with_delay_threshold(config.delay_limit as f32)
+            .with_loss_threshold(config.tlr as f32)
+            .with_health_check_url(config.http.clone())
+            .with_ports(config.tls_port, config.http_port)
+            .with_timeout(REQUEST_TIMEOUT_MS)
+            .with_notify(notify_tx)
+            .with_colo_filter(colo_filter.clone());
+        // 客户端连接预算与测速/健康检查请求超时同源，rebuild_client 沿用同一值
+        let client = Arc::new(build_hyper_client(lb_builder.timeout_ms()));
+        let lb = Arc::new(lb_builder.with_client(client.clone()).with_max_sticky_slots(config.max_sticky_slots));
 
         crate::core::init_global_limiter(config.threads);
 
@@ -823,6 +821,22 @@ mod tests {
         assert!(!service.is_running(), "绑定失败后相位必须回滚为 Stopped");
 
         drop(occupied);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 初次构建与 rebuild_client 的连接预算同源：都以负载均衡器持有的
+    /// 请求超时为准，不回退到延迟阈值
+    #[test]
+    fn client_connect_budget_matches_request_timeout() {
+        let rt = test_runtime();
+        let (service, path) = service_with_ip_file("timeout_source");
+        let _guard = rt.handle().enter();
+
+        service.start().unwrap();
+        let lb = service.get_loadbalancer().expect("运行中应持有负载均衡器");
+        assert_eq!(lb.timeout_ms(), REQUEST_TIMEOUT_MS);
+
+        rt.block_on(service.stop()).unwrap();
         std::fs::remove_file(&path).ok();
     }
 
