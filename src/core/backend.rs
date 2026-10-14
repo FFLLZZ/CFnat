@@ -54,20 +54,20 @@ impl Backend {
     }
 
     pub fn record(&self, delay_ms: Option<f32>, loss: f32) {
-        let is_first = self.sample_count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        let is_first = self.sample_count.try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             Some(if count == 0 { 1 } else { (count + 1).min(get_global_config().sample_window as usize) })
         }).map(|old| old == 0).unwrap();
 
         let alpha = get_global_config().alpha;
         if let Some(delay) = delay_ms {
-            let _ = self.avg_delay.fetch_update(Ordering::AcqRel, Ordering::Acquire, |bits| {
+            let _ = self.avg_delay.try_update(Ordering::AcqRel, Ordering::Acquire, |bits| {
                 let current = f32::from_bits(bits);
                 let new_val = if is_first { delay } else { (current * (1.0 - alpha)) + (delay * alpha) };
                 Some(new_val.to_bits())
             });
         }
 
-        let _ = self.avg_loss.fetch_update(Ordering::AcqRel, Ordering::Acquire, |bits| {
+        let _ = self.avg_loss.try_update(Ordering::AcqRel, Ordering::Acquire, |bits| {
             let current = f32::from_bits(bits);
             let new_val = if is_first { loss } else { (current * (1.0 - alpha)) + (loss * alpha) };
             Some(new_val.to_bits())
