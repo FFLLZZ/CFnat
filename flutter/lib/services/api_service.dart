@@ -57,6 +57,12 @@ class ApiService extends AppService {
 
   void _startStreaming() async {
     if (isDisposed) return;
+    // 定时器重连路径可能残留已终结的旧订阅：流已 done，cancel 只是资源清尾，
+    // 不阻塞新流建立；活跃流的等待式释放由 _restartStreaming 负责
+    _streamSubscription?.cancel();
+    _streamClient?.close();
+    _streamSubscription = null;
+    _streamClient = null;
     final generation = ++_streamGeneration;
     try {
       final client = _newClient();
@@ -123,6 +129,8 @@ class ApiService extends AppService {
           );
     } catch (e) {
       debugPrint('启动SSE失败: $e');
+      // 旧流的延迟异常不得改写当前状态或触发重连
+      if (generation != _streamGeneration) return;
       _handleDisconnect();
       _scheduleReconnect();
     }
